@@ -605,6 +605,16 @@ def initialize_mamba_ssu_backend(
     ):
         return
 
+    from vllm.model_executor.layers.mamba.ops.batch_invariant import (
+        check_mamba_batch_invariant_compat,
+    )
+
+    check_mamba_batch_invariant_compat(
+        backend=mamba_config.backend,
+        use_replayssm=use_replayssm,
+        enable_stochastic_rounding=mamba_config.enable_stochastic_rounding,
+    )
+
     global _flashinfer_replayssm_kernel, _mamba_ssu_backend
     backend = mamba_config.backend
 

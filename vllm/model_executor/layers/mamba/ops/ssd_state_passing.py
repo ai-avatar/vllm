@@ -8,6 +8,10 @@
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.batch_invariant import (
+    SSD_STATE_PASSING_BI_CONFIG,
+    launch_triton,
+)
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.triton_utils import tl, triton
 
@@ -121,7 +125,10 @@ def _state_passing_fwd(
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE"]), batch, nheads)
     with torch.accelerator.device_index(states.device.index):
-        _state_passing_fwd_kernel[grid](
+        launch_triton(
+            _state_passing_fwd_kernel,
+            grid,
+            bi_config=SSD_STATE_PASSING_BI_CONFIG,
             states_ptr=states,
             out_ptr=out,
             dA_cs_ptr=dA_cumsum,

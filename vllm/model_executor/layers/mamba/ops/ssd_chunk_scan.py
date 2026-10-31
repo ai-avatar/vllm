@@ -8,6 +8,10 @@
 
 from packaging import version
 
+from vllm.model_executor.layers.mamba.ops.batch_invariant import (
+    SSD_GEMM_BI_CONFIG,
+    launch_triton,
+)
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -488,7 +492,10 @@ def _chunk_scan_fwd(
         else (0, 0, 0, 0)
     )
 
-    _chunk_scan_fwd_kernel[grid](
+    launch_triton(
+        _chunk_scan_fwd_kernel,
+        grid,
+        bi_config=SSD_GEMM_BI_CONFIG,
         cb_ptr=cb,
         x_ptr=x,
         z_ptr=z,

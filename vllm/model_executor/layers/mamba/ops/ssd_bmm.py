@@ -8,6 +8,10 @@
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.batch_invariant import (
+    SSD_GEMM_BI_CONFIG,
+    launch_triton,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -186,7 +190,10 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
         nchunks * ngroups,
     )
     with torch.accelerator.device_index(a.device.index):
-        _bmm_chunk_fwd_kernel[grid](
+        launch_triton(
+            _bmm_chunk_fwd_kernel,
+            grid,
+            bi_config=SSD_GEMM_BI_CONFIG,
             a_ptr=a,
             b_ptr=b,
             out_ptr=out,

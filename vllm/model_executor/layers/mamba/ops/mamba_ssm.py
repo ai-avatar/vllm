@@ -186,6 +186,11 @@ def try_get_optimal_ssm_config(
     """
     if _ssm_config_override is not None:
         return _ssm_config_override
+    # Tuned JSON configs are keyed by effective_batch = batch * nheads, so a
+    # different decode occupancy would change BLOCK_SIZE_M. Pin the default
+    # heuristic, which depends only on dstate and the device family.
+    if envs.VLLM_BATCH_INVARIANT:
+        return _get_default_ssm_launch_config(dstate, is_blackwell)
     return _try_get_optimal_ssm_config_cached(
         headdim, dstate, batch, nheads, cache_dtype, is_blackwell
     )
