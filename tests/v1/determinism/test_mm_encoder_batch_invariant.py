@@ -84,3 +84,117 @@ def test_execute_mm_encoder_batches_when_bi_off(monkeypatch: pytest.MonkeyPatch)
     assert len(outputs) == 2
     assert batch_sizes == [2]
     envs.disable_envs_cache()
+
+
+def test_v1_gpu_model_runner_encodes_audio_one_at_a_time(
+    enable_batch_invariant, monkeypatch: pytest.MonkeyPatch
+):
+    """V1 GPUModelRunner._execute_mm_encoder must not batch audios under BI.
+
+    Production nemotron-api sets VLLM_USE_V2_MODEL_RUNNER=0; the V2
+    EncoderRunner change does not run on that path.
+    """
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    embed_batch_sizes: list[int] = []
+
+    def fake_group(items, device=None, pin_memory=False):
+        yield "audio", len(items), {"audio": [None] * len(items)}
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.group_and_batch_mm_kwargs",
+        fake_group,
+    )
+
+    class Model:
+        def embed_multimodal(self, **kwargs):
+            n = len(kwargs["audio"])
+            embed_batch_sizes.append(n)
+            return [torch.zeros(2, 4) for _ in range(n)]
+
+    @contextmanager
+    def _no_timing(*_args, **_kwargs):
+        yield
+
+    runner = SimpleNamespace(
+        observability_config=None,
+        model=Model(),
+        lora_config=None,
+        is_multimodal_pruning_enabled=False,
+        requires_sequential_video_encoding=False,
+        encoder_cudagraph_manager=None,
+        device=torch.device("cpu"),
+        timed_encoder_operation=_no_timing,
+    )
+    runner._batch_mm_inputs_from_scheduler = lambda _out: (
+        ["h0", "h1", "h2"],
+        [("audio", None), ("audio", None), ("audio", None)],
+        [("r0", None), ("r1", None), ("r2", None)],
+    )
+    runner._cache_encoder_output = lambda *args, **kwargs: None
+
+    outputs = GPUModelRunner._execute_mm_encoder(
+        runner,
+        SimpleNamespace(ec_manager_metadata=None, free_encoder_mm_hashes=[]),
+    )
+    assert len(outputs) == 3
+    assert embed_batch_sizes == [1, 1, 1]
+
+
+def test_v1_gpu_model_runner_batches_audio_when_bi_off(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    envs.disable_envs_cache()
+    embed_batch_sizes: list[int] = []
+
+    def fake_group(items, device=None, pin_memory=False):
+        yield "audio", len(items), {"audio": [None] * len(items)}
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.group_and_batch_mm_kwargs",
+        fake_group,
+    )
+
+    class Model:
+        def embed_multimodal(self, **kwargs):
+            n = len(kwargs["audio"])
+            embed_batch_sizes.append(n)
+            return [torch.zeros(2, 4) for _ in range(n)]
+
+    @contextmanager
+    def _no_timing(*_args, **_kwargs):
+        yield
+
+    runner = SimpleNamespace(
+        observability_config=None,
+        model=Model(),
+        lora_config=None,
+        is_multimodal_pruning_enabled=False,
+        requires_sequential_video_encoding=False,
+        encoder_cudagraph_manager=None,
+        device=torch.device("cpu"),
+        timed_encoder_operation=_no_timing,
+    )
+    runner._batch_mm_inputs_from_scheduler = lambda _out: (
+        ["h0", "h1"],
+        [("audio", None), ("audio", None)],
+        [("r0", None), ("r1", None)],
+    )
+    runner._cache_encoder_output = lambda *args, **kwargs: None
+
+    outputs = GPUModelRunner._execute_mm_encoder(
+        runner,
+        SimpleNamespace(ec_manager_metadata=None, free_encoder_mm_hashes=[]),
+    )
+    assert len(outputs) == 2
+    assert embed_batch_sizes == [2]
+    envs.disable_envs_cache()

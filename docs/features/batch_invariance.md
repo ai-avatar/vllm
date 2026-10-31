@@ -159,6 +159,8 @@ in the decode or prefill batch.
 - **MTP speculative decoding.** The drafter and target share the pinned
   Mamba2 / MoE / attention / RMSNorm paths. Alone-vs-batched invariance is
   about each request's target-greedy tokens, not MTP-on vs MTP-off equality.
+  Mixed prefill+decode steps stay allowed; they are not a source of
+  short-clip flips.
 - **Chunked prefill.** Partial prefill chunks are forced to end on a Mamba
   SSD `chunk_size` boundary (128 for NemotronH). An unaligned split computes
   intra-chunk terms differently from an unsplit run; aligned splits are
@@ -167,11 +169,10 @@ in the decode or prefill batch.
   was written under the same batch-invariant process. Production Nemotron
   Transcribe already uses `--no-enable-prefix-caching`; keep that until you
   have validated APC on the real checkpoint.
-- **MTP speculative decoding** still runs. Decode tokens are not mixed with
-  prefill tokens in the same step (the leftover short-clip near-tie flips
-  were step-composition, not MTP).
-- **Audio / multimodal encoder.** Each encoder item is encoded alone, so the
-  NeMo plugin cannot pad several clips into one GEMM.
+- **Audio / multimodal encoder.** Each encoder item is encoded alone in both
+  the V1 `GPUModelRunner` and the V2 `EncoderRunner`, so the NeMo plugin
+  cannot pad several clips into one GEMM. Production nemotron-api uses
+  `VLLM_USE_V2_MODEL_RUNNER=0`.
 
 ### What you must disable (explicit errors, not silent)
 
@@ -257,17 +258,18 @@ Prod flags, MTP 8, chunked prefill 4096, `--no-enable-prefix-caching`.
 `tok/s` is completion tokens / wall.
 
 | | c1 | c8 | c16 | c32 | 8×EN | KV cache |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | baseline BF16 | 144 tok/s | 287 | 390 | 493 | 456 | 420k |
-| BI + alignment | 91 | 209 | 299 | 355 | 340 | 437k |
-| cost | −37% | −27…−32% | −23…−28% | −28…−32% | −26% | ≈ |
+| BI + alignment + V1 per-item encode | 90 | 197 | 268 | 319 | 298 | 437k |
+| cost | −37% | −31% | −31% | −35% | −35% | ≈ |
 
-Measured end-to-end cost is about **23–37%** on A100 (the first PR estimate
-of 15–35% was a bit low). H100 was not re-measured; expect the same class
-of cost plus the explicit BI matmul on the router gate. Memory is about
-unchanged. Encoder isolation (one clip per encode) adds a small first-step
-latency when several audios arrive together; decode/prefill isolation
-prevents filling leftover token budget with the other phase.
+A100 BF16 Nemotron 3.5 Transcribe, prod flags (MTP on, mixed prefill+decode
+steps allowed): **0/152** concurrent-vs-alone diffs, mix3 20/20 identical.
+Cost is about **31–37%** vs non-BI baseline. A decode-only/prefill-only
+step split is **not** enabled: it is not needed for invariance and cut
+throughput roughly in half (129/140/151 tok/s at c8/16/32). H100 was not
+re-measured; expect the same class of cost plus the explicit BI matmul on
+the router gate. Memory is about unchanged.
 
 FP8 weights, Marlin, and sm89 FP8 GEMM are intentionally not covered.
 
@@ -285,10 +287,10 @@ When batch invariance is enabled, vLLM:
 7. For Mamba2, pins SSD Triton tiles and the decode SSU launch config so they
    no longer depend on token count or `effective_batch`. FlashInfer SSU,
    ReplaySSM, and Mamba stochastic rounding are rejected rather than ignored.
-   Prefill splits are aligned to the Mamba chunk size; decode is not mixed
-   with prefill in the same step; multimodal encoder items run one at a time.
-   The MoE router gate (`GateLinear` `torch.mm(..., out_dtype=fp32)` on
-   H100) is routed through the batch-invariant matmul.
+   Prefill splits are aligned to the Mamba chunk size. Multimodal encoder
+   items run one at a time on both the V1 and V2 runners. The MoE router
+   gate (`GateLinear` `torch.mm(..., out_dtype=fp32)` on H100) is routed
+   through the batch-invariant matmul.
 
 !!! warning
     Batch invariance under tensor parallelism is not yet supported for all-reduces whose size isn't a multiple of 16 bytes, for example a hidden size that isn't a multiple of 8 in fp16/bf16. Such tensors can switch between NCCL and custom all-reduce depending on batch size. All validated models meet this requirement.

@@ -440,8 +440,6 @@ class Scheduler(SchedulerInterface):
             {} if self.log_stats and self.connector is not None else None
         )
         self._kv_fetch_counts: dict[str, int] = dict.fromkeys(KV_FETCH_STAGES, 0)
-        self._bi_prefill_scheduled = False
-        self._bi_decode_scheduled = False
 
     def _bi_mamba_chunk_aligned(
         self,
@@ -465,33 +463,6 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end or end >= prefill_end:
             return num_new_tokens
         return max(0, (end // chunk_size) * chunk_size - start)
-
-    def _bi_skip_mixed_phase(
-        self, request: Request, extra_computed: int = 0
-    ) -> bool:
-        """True if this request would mix decode with prefill under BI."""
-        if not (envs.VLLM_BATCH_INVARIANT and self.has_mamba_layers):
-            return False
-        start = request.num_computed_tokens + extra_computed
-        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
-        is_prefill = start < prefill_end
-        if is_prefill and self._bi_decode_scheduled:
-            return True
-        if not is_prefill and self._bi_prefill_scheduled:
-            return True
-        return False
-
-    def _bi_note_scheduled(
-        self, request: Request, extra_computed: int = 0
-    ) -> None:
-        if not (envs.VLLM_BATCH_INVARIANT and self.has_mamba_layers):
-            return
-        start = request.num_computed_tokens + extra_computed
-        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
-        if start < prefill_end:
-            self._bi_prefill_scheduled = True
-        else:
-            self._bi_decode_scheduled = True
 
     def _mamba_block_aligned_split(
         self,
@@ -676,9 +647,6 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
-        # Under BI + Mamba, a step is decode-only or prefill-only.
-        self._bi_prefill_scheduled = False
-        self._bi_decode_scheduled = False
         # Whether any scheduled request has a synchronous connector KV load.
         has_sync_kv_loads = False
 
@@ -742,10 +710,6 @@ class Scheduler(SchedulerInterface):
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
-                req_index += 1
-                continue
-
-            if self._bi_skip_mixed_phase(request):
                 req_index += 1
                 continue
 
@@ -911,7 +875,6 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
-            self._bi_note_scheduled(request)
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -1244,27 +1207,21 @@ class Scheduler(SchedulerInterface):
                     extra_computed = (
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
-                    if self._bi_skip_mixed_phase(request, extra_computed):
-                        skip_request(request_queue)
-                        continue
                     num_new_tokens = self._bi_mamba_chunk_aligned(
                         request, num_new_tokens, extra_computed
                     )
                     if num_new_tokens == 0:
                         skip_request(request_queue)
                         continue
-                        if (
-                            pad_spec_decode
-                            and num_new_tokens != 1 + self.num_spec_tokens
-                        ):
-                            # Alignment clipped the placeholder rows. The split
-                            # aligns prefill chunks, but the padded tail rows are
-                            # speculative positions, not prefill tokens. A padded
-                            # request must keep all 1 + num_spec rows or the
-                            # sampler's row count stops matching its query rows,
-                            # so drop the padding instead of shortening it.
-                            num_new_tokens = 1
-                            pad_spec_decode = False
+                    if pad_spec_decode and num_new_tokens != 1 + self.num_spec_tokens:
+                        # Alignment clipped the placeholder rows. The split
+                        # aligns prefill chunks, but the padded tail rows are
+                        # speculative positions, not prefill tokens. A padded
+                        # request must keep all 1 + num_spec rows or the
+                        # sampler's row count stops matching its query rows,
+                        # so drop the padding instead of shortening it.
+                        num_new_tokens = 1
+                        pad_spec_decode = False
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -1441,7 +1398,6 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-                self._bi_note_scheduled(request)
                 self._set_kv_fetch_stage(request, None)
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
