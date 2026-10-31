@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -439,6 +440,58 @@ class Scheduler(SchedulerInterface):
             {} if self.log_stats and self.connector is not None else None
         )
         self._kv_fetch_counts: dict[str, int] = dict.fromkeys(KV_FETCH_STAGES, 0)
+        self._bi_prefill_scheduled = False
+        self._bi_decode_scheduled = False
+
+    def _bi_mamba_chunk_aligned(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        extra_computed: int = 0,
+    ) -> int:
+        """End every *partial* prefill on a Mamba SSD chunk boundary.
+
+        An unaligned continuation (``initial_states`` into a mid-chunk)
+        computes intra-chunk CB/scan terms differently from an unsplit run.
+        Splits at ``end % chunk_size == 0`` are bit-identical. The last
+        chunk of a prompt is left unclipped: it is not a continuation.
+        """
+        if not (envs.VLLM_BATCH_INVARIANT and self.has_mamba_layers):
+            return num_new_tokens
+        chunk_size = self.vllm_config.model_config.get_mamba_chunk_size() or 128
+        start = request.num_computed_tokens + extra_computed
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        end = start + num_new_tokens
+        if start >= prefill_end or end >= prefill_end:
+            return num_new_tokens
+        return max(0, (end // chunk_size) * chunk_size - start)
+
+    def _bi_skip_mixed_phase(
+        self, request: Request, extra_computed: int = 0
+    ) -> bool:
+        """True if this request would mix decode with prefill under BI."""
+        if not (envs.VLLM_BATCH_INVARIANT and self.has_mamba_layers):
+            return False
+        start = request.num_computed_tokens + extra_computed
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        is_prefill = start < prefill_end
+        if is_prefill and self._bi_decode_scheduled:
+            return True
+        if not is_prefill and self._bi_prefill_scheduled:
+            return True
+        return False
+
+    def _bi_note_scheduled(
+        self, request: Request, extra_computed: int = 0
+    ) -> None:
+        if not (envs.VLLM_BATCH_INVARIANT and self.has_mamba_layers):
+            return
+        start = request.num_computed_tokens + extra_computed
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start < prefill_end:
+            self._bi_prefill_scheduled = True
+        else:
+            self._bi_decode_scheduled = True
 
     def _mamba_block_aligned_split(
         self,
@@ -623,6 +676,9 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
+        # Under BI + Mamba, a step is decode-only or prefill-only.
+        self._bi_prefill_scheduled = False
+        self._bi_decode_scheduled = False
         # Whether any scheduled request has a synchronous connector KV load.
         has_sync_kv_loads = False
 
@@ -689,6 +745,10 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if self._bi_skip_mixed_phase(request):
+                req_index += 1
+                continue
+
             if (
                 self.ec_connector is not None
                 and request.mm_features
@@ -725,6 +785,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+            num_new_tokens = self._bi_mamba_chunk_aligned(request, num_new_tokens)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -850,6 +911,7 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            self._bi_note_scheduled(request)
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -1179,6 +1241,18 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             break
+                    extra_computed = (
+                        num_new_local_computed_tokens + num_external_computed_tokens
+                    )
+                    if self._bi_skip_mixed_phase(request, extra_computed):
+                        skip_request(request_queue)
+                        continue
+                    num_new_tokens = self._bi_mamba_chunk_aligned(
+                        request, num_new_tokens, extra_computed
+                    )
+                    if num_new_tokens == 0:
+                        skip_request(request_queue)
+                        continue
                         if (
                             pad_spec_decode
                             and num_new_tokens != 1 + self.num_spec_tokens
@@ -1367,6 +1441,7 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                self._bi_note_scheduled(request)
                 self._set_kv_fetch_stage(request, None)
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens

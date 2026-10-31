@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
@@ -225,9 +226,41 @@ class GateLinear(ReplicatedLinear):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         return output if not self.return_bias else (output, None)
 
+    def _forward_batch_invariant(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        """Route the gate through the pinned batch-invariant matmul.
+
+        Hopper/Blackwell BI mode does not install an ``aten::mm`` override
+        (it only disables split-K via the cuBLAS workspace). The tier-5
+        ``torch.mm(..., out_dtype=fp32)`` epilogue still picks a
+        batch-dependent reduction, so we call ``mm_batch_invariant``
+        explicitly and cast to ``out_dtype``.
+        """
+        from vllm.model_executor.determinism.batch_invariant import (
+            mm_batch_invariant,
+        )
+
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1])
+        weight = self.weight
+        if x_2d.dtype != weight.dtype:
+            if weight.dtype == torch.float32:
+                x_2d = x_2d.to(dtype=torch.float32)
+            else:
+                weight = weight.to(dtype=x_2d.dtype)
+        output = mm_batch_invariant(x_2d, weight.t())
+        if self.out_dtype is not None and output.dtype != self.out_dtype:
+            output = output.to(dtype=self.out_dtype)
+        output = output.view(*orig_shape[:-1], output.shape[-1])
+        return self._return(output)
+
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if envs.VLLM_BATCH_INVARIANT:
+            return self._forward_batch_invariant(x)
+
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if (
             self.allow_ll_bf16_gemm

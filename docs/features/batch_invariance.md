@@ -159,12 +159,19 @@ in the decode or prefill batch.
 - **MTP speculative decoding.** The drafter and target share the pinned
   Mamba2 / MoE / attention / RMSNorm paths. Alone-vs-batched invariance is
   about each request's target-greedy tokens, not MTP-on vs MTP-off equality.
-- **Chunked prefill.** Varlen SSD already splits on sequence and chunk
-  boundaries; only the tile is pinned.
+- **Chunked prefill.** Partial prefill chunks are forced to end on a Mamba
+  SSD `chunk_size` boundary (128 for NemotronH). An unaligned split computes
+  intra-chunk terms differently from an unsplit run; aligned splits are
+  bit-identical. The last chunk of a prompt is not clipped.
 - **Prefix caching.** Not disabled. Cached Mamba/KV state is only valid if it
   was written under the same batch-invariant process. Production Nemotron
   Transcribe already uses `--no-enable-prefix-caching`; keep that until you
   have validated APC on the real checkpoint.
+- **MTP speculative decoding** still runs. Decode tokens are not mixed with
+  prefill tokens in the same step (the leftover short-clip near-tie flips
+  were step-composition, not MTP).
+- **Audio / multimodal encoder.** Each encoder item is encoded alone, so the
+  NeMo plugin cannot pad several clips into one GEMM.
 
 ### What you must disable (explicit errors, not silent)
 
@@ -238,26 +245,29 @@ Kernel tests (GPU when present; CPU covers the config / backend checks):
 ```bash
 .venv/bin/python -m pytest \
   tests/kernels/mamba/test_mamba2_batch_invariant.py \
-  tests/v1/determinism/test_mamba2_moe_batch_invariant.py -v
+  tests/v1/determinism/test_mamba2_moe_batch_invariant.py \
+  tests/v1/determinism/test_mamba2_bi_scheduler.py \
+  tests/v1/determinism/test_mm_encoder_batch_invariant.py \
+  tests/v1/determinism/test_gate_linear_batch_invariant.py -v
 ```
 
-### Speed cost (estimate, not measured on the 60 GB checkpoint)
+### Speed cost (A100 BF16 Nemotron 3.5 Transcribe, measured)
 
-This environment has no A100/H100, so the following is from the kernel
-changes and vLLM's existing batch-invariant matmul / MoE paths:
+Prod flags, MTP 8, chunked prefill 4096, `--no-enable-prefix-caching`.
+`tok/s` is completion tokens / wall.
 
-| Path | Why it slows down | Expected cost |
-|---|---|---|
-| A100 (sm80) BF16 GEMM | Triton persistent matmul replaces cuBLASLt | ~15–35% decode, ~10–25% prefill |
-| H100 (sm90) BF16 GEMM | split-K disabled via `CUBLAS_WORKSPACE_CONFIG` | ~10–25% decode, smaller on prefill |
-| Mamba2 SSD prefill | one 64×64×32 tile, `num_stages=1` | ~10–25% on the SSD kernels |
-| Unquantized fused MoE | fixed 64×64×32, `SPLIT_K=1` | ~20–40% on decode MoE at large batch |
-| Attention | `num_splits=1` (already in tree) | small on decode, more on long prefill |
+| | c1 | c8 | c16 | c32 | 8×EN | KV cache |
+|---|---|---|---|---|---|---|
+| baseline BF16 | 144 tok/s | 287 | 390 | 493 | 456 | 420k |
+| BI + alignment | 91 | 209 | 299 | 355 | 340 | 437k |
+| cost | −37% | −27…−32% | −23…−28% | −28…−32% | −26% | ≈ |
 
-End-to-end for Nemotron 3.5 Transcribe BF16, MTP on, chunked prefill 4096:
-**plan on about 15–35% lower tokens/s on A100 and 10–25% on H100**, with
-memory about unchanged. Validate with `vllm bench serve` on the real
-checkpoint; the kernel tests here only check bit-identity, not throughput.
+Measured end-to-end cost is about **23–37%** on A100 (the first PR estimate
+of 15–35% was a bit low). H100 was not re-measured; expect the same class
+of cost plus the explicit BI matmul on the router gate. Memory is about
+unchanged. Encoder isolation (one clip per encode) adds a small first-step
+latency when several audios arrive together; decode/prefill isolation
+prevents filling leftover token budget with the other phase.
 
 FP8 weights, Marlin, and sm89 FP8 GEMM are intentionally not covered.
 
@@ -275,6 +285,10 @@ When batch invariance is enabled, vLLM:
 7. For Mamba2, pins SSD Triton tiles and the decode SSU launch config so they
    no longer depend on token count or `effective_batch`. FlashInfer SSU,
    ReplaySSM, and Mamba stochastic rounding are rejected rather than ignored.
+   Prefill splits are aligned to the Mamba chunk size; decode is not mixed
+   with prefill in the same step; multimodal encoder items run one at a time.
+   The MoE router gate (`GateLinear` `torch.mm(..., out_dtype=fp32)` on
+   H100) is routed through the batch-invariant matmul.
 
 !!! warning
     Batch invariance under tensor parallelism is not yet supported for all-reduces whose size isn't a multiple of 16 bytes, for example a hidden size that isn't a multiple of 8 in fp16/bf16. Such tensors can switch between NCCL and custom all-reduce depending on batch size. All validated models meet this requirement.

@@ -70,10 +70,24 @@ SSD_STATE_PASSING_BI_CONFIG: dict[str, Any] = {
 
 
 def _unwrap_triton_kernel(kernel: Any) -> Any:
-    """Unwrap Autotuner / Heuristics wrappers to the raw JITFunction."""
+    """Unwrap Autotuner / Heuristics wrappers, stopping at JITFunction.
+
+    ``JITFunction.fn`` is the plain Python source. Unwrapping through it
+    makes ``raw[grid]`` raise ``TypeError: 'function' object is not
+    subscriptable`` on every SSD prefill launch.
+    """
+    try:
+        from triton.runtime.jit import JITFunction
+    except ImportError:  # pragma: no cover - triton always present on GPU
+        JITFunction = ()  # type: ignore[misc, assignment]
+
     current = kernel
     seen: set[int] = set()
-    while hasattr(current, "fn") and id(current.fn) not in seen:
+    while (
+        not isinstance(current, JITFunction)
+        and hasattr(current, "fn")
+        and id(current.fn) not in seen
+    ):
         seen.add(id(current))
         current = current.fn
     return current

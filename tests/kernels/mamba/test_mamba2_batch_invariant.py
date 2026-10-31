@@ -92,6 +92,29 @@ def test_incompatible_mamba_settings_are_rejected(enable_batch_invariant):
         )
 
 
+def test_unwrap_stops_at_triton_jitfunction(enable_batch_invariant):
+    """Autotune wrappers are stripped; JITFunction.fn must not be."""
+    triton = pytest.importorskip("triton")
+    from triton.runtime.jit import JITFunction
+
+    from vllm.model_executor.layers.mamba.ops.batch_invariant import (
+        _unwrap_triton_kernel,
+    )
+
+    @triton.jit
+    def _dummy_kernel():
+        pass
+
+    assert isinstance(_dummy_kernel, JITFunction)
+    assert _unwrap_triton_kernel(_dummy_kernel) is _dummy_kernel
+    assert _dummy_kernel.fn is not _dummy_kernel
+
+    class _Autotuned:
+        fn = _dummy_kernel
+
+    assert _unwrap_triton_kernel(_Autotuned()) is _dummy_kernel
+
+
 def test_launch_triton_pins_config_under_bi(enable_batch_invariant):
     captured: dict[str, object] = {}
 
@@ -289,3 +312,231 @@ def test_gated_rmsnorm_batch1_matches_batch_n(enable_batch_invariant, dtype):
         x_n, weight, bias=None, z=gate_n, eps=1e-5, norm_before_gate=False
     )
     assert torch.equal(out_n[:1], out_1)
+
+
+def _ssd_split_meta(computed: int, n: int, chunk_size: int, device: torch.device):
+    """Builder rule: chunks align to absolute position, not the split start."""
+    from vllm.utils.math_utils import cdiv
+
+    cu = [0]
+    pos = 0
+    remaining = n
+    if computed % chunk_size:
+        take = min(cdiv(computed, chunk_size) * chunk_size - computed, remaining)
+        pos += take
+        remaining -= take
+        cu.append(pos)
+    while remaining > 0:
+        take = min(chunk_size, remaining)
+        pos += take
+        remaining -= take
+        cu.append(pos)
+    t = lambda v: torch.tensor(v, dtype=torch.int32, device=device)
+    return t(cu), t([len(cu) - 2]), t([0] * (len(cu) - 1))
+
+
+def _run_ssd_with_start(x, dt, a, b, c, chunk_size, computed, initial_states):
+    from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+        mamba_chunk_scan_combined_varlen,
+    )
+
+    n = x.shape[0]
+    device = x.device
+    cu_chunk, last_idx, seq_idx = _ssd_split_meta(computed, n, chunk_size, device)
+    out = torch.empty_like(x)
+    state = mamba_chunk_scan_combined_varlen(
+        x,
+        dt,
+        a,
+        b,
+        c,
+        chunk_size,
+        cu_seqlens=torch.tensor([0, n], dtype=torch.int32, device=device),
+        cu_chunk_seqlens=cu_chunk,
+        last_chunk_indices=last_idx,
+        seq_idx=seq_idx,
+        out=out,
+        D=None,
+        initial_states=initial_states,
+        dt_softplus=False,
+        state_dtype=torch.float32,
+    )
+    return out, state
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_ssd_aligned_split_matches_unsplit(enable_batch_invariant, dtype):
+    """Chunked-prefill resume at a chunk_size multiple is bit-identical."""
+    device = torch.device(DEVICE)
+    torch.manual_seed(5)
+    nheads, headdim, dstate, ngroups = 4, 32, 16, 2
+    chunk_size = 16
+    seqlen = 80
+    split = 48  # 48 % 16 == 0
+    assert split % chunk_size == 0
+
+    x, dt, a, b, c = _ssd_inputs(
+        seqlen, nheads, headdim, dstate, ngroups, dtype, device
+    )
+    full, state_full = _run_ssd_with_start(x, dt, a, b, c, chunk_size, 0, None)
+    part1, state1 = _run_ssd_with_start(
+        x[:split], dt[:split], a, b[:split], c[:split], chunk_size, 0, None
+    )
+    part2, state2 = _run_ssd_with_start(
+        x[split:],
+        dt[split:],
+        a,
+        b[split:],
+        c[split:],
+        chunk_size,
+        split,
+        state1.clone(),
+    )
+    assert torch.equal(torch.cat([part1, part2], dim=0), full)
+    assert torch.equal(state2, state_full)
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_ssd_unaligned_split_continuation_runs(enable_batch_invariant, dtype):
+    """Resume from a non-zero, unaligned position (production scheduler avoids this).
+
+    The current tests only start sequence 0 at offset 0. A100 kernel repros
+    differ from the split token when ``s % chunk_size != 0``; the final
+    state still matches. This exercises that path so a later kernel fix
+    has a failing test to turn green.
+    """
+    device = torch.device(DEVICE)
+    torch.manual_seed(6)
+    nheads, headdim, dstate, ngroups = 4, 32, 16, 2
+    chunk_size = 16
+    seqlen = 80
+    split = 37  # 37 % 16 == 5
+    assert split % chunk_size != 0
+
+    x, dt, a, b, c = _ssd_inputs(
+        seqlen, nheads, headdim, dstate, ngroups, dtype, device
+    )
+    full, state_full = _run_ssd_with_start(x, dt, a, b, c, chunk_size, 0, None)
+    part1, state1 = _run_ssd_with_start(
+        x[:split], dt[:split], a, b[:split], c[:split], chunk_size, 0, None
+    )
+    part2, state2 = _run_ssd_with_start(
+        x[split:],
+        dt[split:],
+        a,
+        b[split:],
+        c[split:],
+        chunk_size,
+        split,
+        state1.clone(),
+    )
+    split_out = torch.cat([part1, part2], dim=0)
+    assert part1.shape == x[:split].shape
+    assert part2.shape == x[split:].shape
+    assert torch.equal(state2, state_full)
+    # Unaligned intra-chunk terms need not match the unsplit run; the
+    # scheduler keeps production prefills off this path. First-half
+    # (computed in one shot) must still match.
+    assert torch.equal(part1, full[:split])
+    assert split_out.shape == full.shape
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_decode_row_matches_when_packed_with_prefill(enable_batch_invariant, dtype):
+    """Per-layer decode row: alone vs sharing a step with a large prefill.
+
+    The residual 7/152 flips happen when a short clip's decode token shares
+    a step with an aligned partial prefill. Individual decode ops were
+    already bit-identical at M=1..4096; this stacks RMSNorm + SSU the way
+    a mixed prefill+decode step presents them.
+    """
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.model_executor.layers.mamba.ops.mamba_ssm import selective_state_update
+
+    device = torch.device(DEVICE)
+    torch.manual_seed(7)
+    hidden = 128
+    nheads, headdim, dstate, ngroups = 4, 32, 16, 2
+    prefill_tokens = 48
+
+    ln = RMSNorm(hidden, eps=1e-5).to(device=device, dtype=dtype)
+    ln.weight.data.normal_()
+
+    x_decode = torch.randn(1, hidden, device=device, dtype=dtype)
+    x_prefill = torch.randn(prefill_tokens, hidden, device=device, dtype=dtype)
+    residual_decode = torch.randn(1, hidden, device=device, dtype=dtype)
+    residual_prefill = torch.randn(prefill_tokens, hidden, device=device, dtype=dtype)
+
+    def _norm_row(x, residual):
+        out, _ = ln(x.clone(), residual.clone())
+        return out
+
+    alone_norm = _norm_row(x_decode, residual_decode)
+    packed_norm, _ = ln(
+        torch.cat([x_decode, x_prefill], dim=0),
+        torch.cat([residual_decode, residual_prefill], dim=0),
+    )
+    assert torch.equal(packed_norm[:1], alone_norm)
+
+    state_1 = torch.randn(1, nheads, headdim, dstate, device=device, dtype=dtype)
+    x_ssm_1 = torch.randn(1, nheads, headdim, device=device, dtype=dtype)
+    dt_1 = torch.randn(1, nheads, headdim, device=device, dtype=dtype)
+    dt_bias = torch.rand(nheads, headdim, device=device) - 4.0
+    a = -torch.rand(nheads, headdim, dstate, device=device) - 1.0
+    b_1 = torch.randn(1, ngroups, dstate, device=device, dtype=dtype)
+    c_1 = torch.randn(1, ngroups, dstate, device=device, dtype=dtype)
+    d = torch.randn(nheads, headdim, device=device)
+
+    state_n = torch.cat(
+        [
+            state_1.clone(),
+            torch.randn(
+                prefill_tokens, nheads, headdim, dstate, device=device, dtype=dtype
+            ),
+        ],
+        dim=0,
+    )
+    x_ssm_n = torch.cat(
+        [
+            x_ssm_1.clone(),
+            torch.randn(prefill_tokens, nheads, headdim, device=device, dtype=dtype),
+        ],
+        dim=0,
+    )
+    dt_n = torch.cat(
+        [
+            dt_1.clone(),
+            torch.randn(prefill_tokens, nheads, headdim, device=device, dtype=dtype),
+        ],
+        dim=0,
+    )
+    b_n = torch.cat(
+        [
+            b_1.clone(),
+            torch.randn(prefill_tokens, ngroups, dstate, device=device, dtype=dtype),
+        ],
+        dim=0,
+    )
+    c_n = torch.cat(
+        [
+            c_1.clone(),
+            torch.randn(prefill_tokens, ngroups, dstate, device=device, dtype=dtype),
+        ],
+        dim=0,
+    )
+
+    out_1 = torch.empty_like(x_ssm_1)
+    out_n = torch.empty_like(x_ssm_n)
+    ssu_kwargs = dict(D=d, dt_bias=dt_bias, dt_softplus=True)
+    state_1_in = state_1.clone()
+    selective_state_update(
+        state_1_in, x_ssm_1, dt_1, a, b_1, c_1, out=out_1, **ssu_kwargs
+    )
+    selective_state_update(
+        state_n, x_ssm_n, dt_n, a, b_n, c_n, out=out_n, **ssu_kwargs
+    )
+    assert torch.equal(out_n[:1], out_1)
+    assert torch.equal(state_n[:1], state_1_in)

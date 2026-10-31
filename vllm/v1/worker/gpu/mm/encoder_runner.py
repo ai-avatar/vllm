@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, supports_realtime
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -150,6 +151,15 @@ class EncoderRunner:
     def execute_mm_encoder(
         self, mm_kwargs: list[tuple[str, MultiModalKwargsItem]]
     ) -> list[torch.Tensor]:
+        # Under BI, encode each item alone so padding/masking cannot
+        # depend on which other clips share the batch.
+        if envs.VLLM_BATCH_INVARIANT and len(mm_kwargs) > 1:
+            return [
+                out
+                for item in mm_kwargs
+                for out in self.execute_mm_encoder([item])
+            ]
+
         # Stable-sort items by modality so each modality is encoded in as few
         # batches as possible. The returned outputs are restored to input order.
         order = sorted(range(len(mm_kwargs)), key=lambda i: mm_kwargs[i][0])
