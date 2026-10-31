@@ -3412,6 +3412,24 @@ class VllmConfig:
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_mamba_batch_invariance(self) -> "VllmConfig":
+        if not envs.VLLM_BATCH_INVARIANT:
+            return self
+        from vllm.model_executor.layers.mamba.ops.batch_invariant import (
+            check_mamba_batch_invariant_compat,
+        )
+
+        try:
+            check_mamba_batch_invariant_compat(
+                backend=self.mamba_config.backend,
+                use_replayssm=self.cache_config.use_replayssm,
+                enable_stochastic_rounding=self.mamba_config.enable_stochastic_rounding,
+            )
+        except RuntimeError as e:
+            raise ValueError(str(e)) from e
+        return self
+
 
 _current_vllm_config: VllmConfig | None = None
 _current_prefix: str | None = None

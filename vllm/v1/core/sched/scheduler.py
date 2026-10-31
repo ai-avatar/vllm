@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -440,6 +441,29 @@ class Scheduler(SchedulerInterface):
         )
         self._kv_fetch_counts: dict[str, int] = dict.fromkeys(KV_FETCH_STAGES, 0)
 
+    def _bi_mamba_chunk_aligned(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        extra_computed: int = 0,
+    ) -> int:
+        """End every *partial* prefill on a Mamba SSD chunk boundary.
+
+        An unaligned continuation (``initial_states`` into a mid-chunk)
+        computes intra-chunk CB/scan terms differently from an unsplit run.
+        Splits at ``end % chunk_size == 0`` are bit-identical. The last
+        chunk of a prompt is left unclipped: it is not a continuation.
+        """
+        if not (envs.VLLM_BATCH_INVARIANT and self.has_mamba_layers):
+            return num_new_tokens
+        chunk_size = self.vllm_config.model_config.get_mamba_chunk_size() or 128
+        start = request.num_computed_tokens + extra_computed
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        end = start + num_new_tokens
+        if start >= prefill_end or end >= prefill_end:
+            return num_new_tokens
+        return max(0, (end // chunk_size) * chunk_size - start)
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -725,6 +749,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+            num_new_tokens = self._bi_mamba_chunk_aligned(request, num_new_tokens)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -1179,18 +1204,24 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             break
-                        if (
-                            pad_spec_decode
-                            and num_new_tokens != 1 + self.num_spec_tokens
-                        ):
-                            # Alignment clipped the placeholder rows. The split
-                            # aligns prefill chunks, but the padded tail rows are
-                            # speculative positions, not prefill tokens. A padded
-                            # request must keep all 1 + num_spec rows or the
-                            # sampler's row count stops matching its query rows,
-                            # so drop the padding instead of shortening it.
-                            num_new_tokens = 1
-                            pad_spec_decode = False
+                    extra_computed = (
+                        num_new_local_computed_tokens + num_external_computed_tokens
+                    )
+                    num_new_tokens = self._bi_mamba_chunk_aligned(
+                        request, num_new_tokens, extra_computed
+                    )
+                    if num_new_tokens == 0:
+                        skip_request(request_queue)
+                        continue
+                    if pad_spec_decode and num_new_tokens != 1 + self.num_spec_tokens:
+                        # Alignment clipped the placeholder rows. The split
+                        # aligns prefill chunks, but the padded tail rows are
+                        # speculative positions, not prefill tokens. A padded
+                        # request must keep all 1 + num_spec rows or the
+                        # sampler's row count stops matching its query rows,
+                        # so drop the padding instead of shortening it.
+                        num_new_tokens = 1
+                        pad_spec_decode = False
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:

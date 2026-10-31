@@ -2921,6 +2921,9 @@ class GPUModelRunner(
             # because it doesn't yet support video batching.
             # TODO(ywang96): Fix memory profiling to take EVS into account and
             # remove this hack.
+            # Sequential encode is also required under BI for every
+            # modality: a batched audio encode pads to the longest clip
+            # and changes the embeddings (VLLM_USE_V2_MODEL_RUNNER=0).
             if (
                 (
                     self.is_multimodal_pruning_enabled
@@ -2928,7 +2931,7 @@ class GPUModelRunner(
                 )
                 and modality == "video"
                 and num_items > 1
-            ):
+            ) or (envs.VLLM_BATCH_INVARIANT and num_items > 1):
                 batch_outputs_lst = list[torch.Tensor]()
                 for video_idx in range(num_items):
                     video_mm_kwargs_item = mm_kwargs[current_item_idx + video_idx]

@@ -104,6 +104,12 @@ class Mamba2AttentionBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        # Prefill SSD tiles and decode SSU configs are pinned when
+        # VLLM_BATCH_INVARIANT=1. See mamba/ops/batch_invariant.py.
+        return True
+
 
 @dataclass
 class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):

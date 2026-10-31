@@ -8,6 +8,11 @@
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.batch_invariant import (
+    SSD_CUMSUM_BI_CONFIG,
+    SSD_GEMM_BI_CONFIG,
+    launch_triton,
+)
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.triton_utils import tl, triton
 
@@ -322,7 +327,10 @@ def _chunk_cumsum_fwd(
     )
     grid_chunk_cs = lambda META: (nchunks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
     with torch.accelerator.device_index(dt.device.index):
-        _chunk_cumsum_fwd_kernel[grid_chunk_cs](
+        launch_triton(
+            _chunk_cumsum_fwd_kernel,
+            grid_chunk_cs,
+            bi_config=SSD_CUMSUM_BI_CONFIG,
             dt_ptr=dt,
             A_ptr=A,
             dt_bias_ptr=dt_bias,
@@ -376,7 +384,10 @@ def _chunk_state_fwd(
         nheads,
     )
     with torch.accelerator.device_index(x.device.index):
-        _chunk_state_fwd_kernel[grid](
+        launch_triton(
+            _chunk_state_fwd_kernel,
+            grid,
+            bi_config=SSD_GEMM_BI_CONFIG,
             x_ptr=x,
             b_ptr=B,
             states_ptr=states,
