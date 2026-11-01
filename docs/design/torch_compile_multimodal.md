@@ -32,9 +32,11 @@ vllm serve <nemotron-transcribe> --hf-overrides '{"encoder_compile": true}'
 
 In-tree vision encoders compile through `@support_torch_compile`. The NeMo
 SpeechLM `perception.encoder` transformer blocks (including Sortformer when
-the plugin mounts it there) are compiled after load with dynamic shapes so
-variable audio lengths do not re-specialize. Flex stays in the compiled
-graph with `FORCE_USE_FLEX_ATTENTION` so short clips do not take
+the plugin mounts it there) are compiled after load. Flex q/k/v and
+`create_block_mask` pad onto a closed bucket set (256-frame whole-forward
+tiles and `window` for last-window remainders) and NeMo's flex wrapper is
+compiled with `dynamic=False` so variable chunk lengths do not
+re-specialize. `FORCE_USE_FLEX_ATTENTION` keeps short clips off
 flex-decoding. The projector / `modality_adapter` stay eager.
 
 ## How Compilation Works for Multimodal Components
@@ -106,10 +108,12 @@ shorter than 128 encoder frames (10.24 s). The leftover
 deferred until after KV allocation; a post-KV graph warmup then
 captures every `(batch, frame-bucket)` (under BI: batch 1 × buckets
 up to the audio cap) using `n_feat` from the perception preprocessor
-/ encoder (`features` / `feat_in`, 128 mels here), then every
-long-audio `n_windows * window` shape. Serving pads the last window
-to `window` so remainders cannot recompile or lazy-capture a new
-tile. Compile-only skips dummy-audio warmup. Warmup time is
+/ encoder (`features` / `feat_in`, 128 mels here), then one
+long-audio `3 * window` dummy. The plugin still windows by
+`processed_len`, so last-window T is `valid % window`; flex q/k/v
+and the block mask pad to `window` (or the next 256-bucket) and
+flex is compiled with `dynamic=False` so those remainders cannot
+recompile. Compile-only skips dummy-audio warmup. Warmup time is
 logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped
 module (`model.unwrap()` / `.runnable`) because
 `CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.
@@ -119,7 +123,9 @@ replay path is a function of each item's valid length, inductor
 timing autotune is disabled (`deterministic=True`) for
 `layer.compile` and NeMo's import-time compiled flex wrapper, and
 served tensors stay on the warmed shape set so later traffic cannot
-change encoder numerics.
+change encoder numerics. `TORCH_LOGS=recompiles,guards` plus the
+post-warmup recompile warning print the last path, processed
+shape/len, and flex q shape/stride/block-mask.
 
 ```bash
 VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \

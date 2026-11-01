@@ -23,6 +23,7 @@ from vllm.compilation.mm_encoder import (
     is_nemo_speechlm_config,
     isolate_flex_attention_from_compile,
     maybe_compile_speech_mm_encoder,
+    speech_encoder_flex_bucket,
     speech_encoder_inductor_config,
     speech_encoder_layer_compile_kwargs,
     speech_encoder_n_feat,
@@ -795,20 +796,129 @@ def test_served_frames_pad_long_remainder_to_window(
     envs.disable_envs_cache()
 
 
-def test_long_warmup_frames_are_every_window_count(
+def test_long_warmup_frames_are_one_three_window_shape(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 160)
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 600)
     envs.disable_envs_cache()
     runner = _FakeGraphRunner()
     runner.window = 550
     runner.max_windows = 2
     frames = speech_encoder_warmup_long_frames(runner)
     assert frames == [3 * 550]
+    assert 4 * 550 not in frames
     assert 2 * 550 + 256 not in frames
-    assert all(length % 550 == 0 for length in frames)
-    assert all(length <= int(160 / 0.08) for length in frames)
     envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    ("frames", "expected"),
+    [
+        (1, 550),
+        (255, 550),
+        (256, 256),
+        (257, 550),
+        (512, 512),
+        (549, 550),
+        (550, 550),
+        (551, 768),
+        (767, 768),
+        (768, 768),
+        (1100, 1100),
+        (1101, 1650),
+        (1280, 1280),
+        (1650, 1650),
+        (1651, 2200),
+    ],
+)
+def test_flex_bucket_maps_remainders_onto_closed_set(frames: int, expected: int):
+    assert (
+        speech_encoder_flex_bucket(frames, window=550, max_windows=2, bucket_step=256)
+        == expected
+    )
+
+
+def test_flex_wrapper_pads_qkv_and_crops_to_valid():
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    seen: dict[str, object] = {}
+
+    def fake_flex(q, k, v, **kwargs):
+        seen["shape"] = tuple(q.shape)
+        seen["contig"] = q.is_contiguous()
+        return q
+
+    wrapped = mm_encoder_mod._pad_flex_wrapper(fake_flex)
+    q = torch.randn(1, 2, 400, 8)
+    k = torch.randn(1, 2, 400, 8)
+    v = torch.randn(1, 2, 400, 8)
+    out = wrapped(q, k, v)
+    assert seen["shape"] == (1, 2, 550, 8)
+    assert seen["contig"] is True
+    assert out.shape == q.shape
+    assert torch.equal(out, q)
+
+
+def test_flex_bucket_boundaries_do_not_recompile_after_warmup():
+    """Every bucket boundary ±1 must reuse the warmed unique graphs."""
+    from torch._dynamo.utils import counters
+
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._set_serving_watch(False)
+    window, max_w = 550, 2
+
+    def bucket_of(frames: int) -> int:
+        return speech_encoder_flex_bucket(
+            frames, window=window, max_windows=max_w, bucket_step=256
+        )
+
+    cap = 4 * window
+    buckets = {bucket_of(frames) for frames in range(1, cap + 1)}
+    boundaries = [
+        frames
+        for bucket in buckets
+        for frames in (bucket - 1, bucket, bucket + 1)
+        if frames > 0
+    ]
+    warm = buckets | {bucket_of(frames) for frames in boundaries}
+
+    weight = torch.randn(8, 8)
+
+    def inner(x: torch.Tensor) -> torch.Tensor:
+        return x @ weight
+
+    compiled = torch.compile(inner, dynamic=False, backend="eager")
+
+    def run(frames: int) -> torch.Tensor:
+        return compiled(torch.zeros(1, bucket_of(frames), 8))
+
+    torch._dynamo.reset()
+    counters.clear()
+    for bucket in sorted(warm):
+        run(bucket)
+    after_warmup = int(counters["stats"]["unique_graphs"])
+    assert after_warmup >= 1
+
+    for frames in boundaries:
+        run(frames)
+    assert int(counters["stats"]["unique_graphs"]) == after_warmup
+
+
+def test_create_block_mask_uses_flex_bucket():
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    isolate_flex_attention_from_compile()
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    def mod(_b, _h, q_idx, kv_idx):
+        return (q_idx < 400) & (kv_idx < 400)
+
+    mask = create_block_mask(mod, 1, 1, 400, 400, device="cpu")
+    assert tuple(int(s) for s in mask.seq_lengths) == (550, 550)
 
 
 def test_long_call_pads_remainder_to_window(monkeypatch: pytest.MonkeyPatch):

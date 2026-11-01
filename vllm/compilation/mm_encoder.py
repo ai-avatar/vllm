@@ -6,8 +6,7 @@ vLLM already compiles in-tree vision encoders via ``@support_torch_compile``
 and ``should_torch_compile_mm_encoder``. The NeMo SpeechLM plugin's
 perception encoder is built outside that decorator. This module compiles
 ``perception.encoder`` transformer blocks (the same set as the plugin's
-``EncoderGraphRunner``) with dynamic shapes so variable audio lengths do
-not re-specialize, and it maps the official compilation flags onto the
+``EncoderGraphRunner``) and maps the official compilation flags onto the
 plugin's ``encoder_compile`` / ``encoder_cuda_graphs`` hf-overrides.
 
 Inductor's flex-decoding kernel is wrong for this encoder's rel-pos
@@ -18,23 +17,31 @@ breaking the NeMo ``_flex_attention_compiled`` wrapper is correct but
 ~6× slower. vLLM owns layer compile so the plugin cannot
 ``compile_layers`` first under graphs.
 
+The plugin windows long audio by ``processed_len``, so the last
+window's T is ``valid % window`` even when the tensor is padded.
+Dynamo then recompiles flex / ``create_block_mask`` on that remainder
+(``seq_lengths``, Q time, often strides). Flex q/k/v and the block
+mask are padded onto a closed bucket set and NeMo's flex wrapper is
+compiled with ``dynamic=False`` so every length in ``0..cap`` hits a
+warmed kernel. Layer compile stays dynamic as a fallback for non-flex
+ops. Long-graph warmup is one 3-window dummy; remainders pad to
+``window``.
+
 Speech encoder CUDA graphs are captured lazily after KV allocation, with
 batch sizes ``(1,)`` under ``VLLM_BATCH_INVARIANT``. The replay path is a
 function of each item's valid length, not the padded tensor width.
 Layer compile is also deferred until after KV so inductor workspaces are
 not counted as peak activation. A post-KV graph warmup then captures
 every (batch, frame-bucket) using ``n_feat`` from the perception
-preprocessor / encoder, then every long-audio ``n_windows * window``
-shape (BI batch 1). Last windows are padded to ``window`` so serving
-never compiles or captures a new remainder. Compile-only skips
-dummy-audio warmup (dynamic shapes).
+preprocessor / encoder, then one long-audio ``3 * window`` shape
+(BI batch 1). Compile-only skips dummy-audio warmup.
 Pending-compile state is stored on the unwrapped module:
 ``CUDAGraphWrapper.__getattr__`` forwards, but ``delattr`` does not.
 
 Under ``VLLM_BATCH_INVARIANT``, inductor ``deterministic`` is pinned
 on ``layer.compile`` and NeMo's flex wrapper so timing autotune cannot
-select different tiles across process starts. Served tensors are
-bucketed onto that closed set so later traffic cannot recompile.
+select different tiles across process starts. Served tensors and flex
+inputs stay on that closed set so later traffic cannot recompile.
 """
 
 from __future__ import annotations
@@ -60,12 +67,18 @@ logger = init_logger(__name__)
 
 _COMPILED_ATTR = "_vllm_mm_encoder_compiled"
 _FLEX_ISOLATED_ATTR = "_vllm_speech_encoder_flex_isolated"
+_FLEX_PADDED_ATTR = "_vllm_speech_encoder_flex_padded"
 _BI_FLEX_COMPILED_ATTR = "_vllm_speech_encoder_flex_bi_compiled"
 _RUNNER_PATCH_ATTR = "_vllm_speech_graph_patched"
 _PENDING_LAYERS_ATTR = "_vllm_speech_encoder_pending_compile"
 _DYNAMO_CONFIGURED = False
 _INDUCTOR_PINNED = False
 _BI_FLEX_COMPILED: Any = None
+_UNWRAPPED_CREATE_BLOCK_MASK: Any = None
+_LAST_ENCODER_PATH = ""
+_LAST_PROCESSED_SHAPE: tuple[int, ...] | None = None
+_LAST_PROCESSED_LEN: int | None = None
+_LAST_FLEX_INPUT: dict[str, Any] = {}
 # getattr on CUDAGraphWrapper forwards to .runnable; delattr does not.
 # Keep a side table so pending layers survive wrap/unwrap either way.
 _PENDING_LAYERS: weakref.WeakKeyDictionary[Any, list[nn.Module]] = (
@@ -87,9 +100,10 @@ _DEFAULT_FRAME_BUCKET = 256
 _DEFAULT_MAX_WINDOWS = 2
 # First long-audio path is 3 windows (2-window clips stay whole-forward).
 _LONG_WARMUP_MIN_WINDOWS = 3
-# Every n_windows from 3 to the audio cap (last window always ``window``).
-# 128 * 550 frames * 80 ms ≈ 94 min, above any serve cap we use.
-_MAX_LONG_WARMUP_SHAPES = 128
+# Flex / last-window remainders pad onto these (overridden from the runner).
+_FLEX_WINDOW = 550
+_FLEX_MAX_WINDOWS = _DEFAULT_MAX_WINDOWS
+_FLEX_BUCKET_STEP = _DEFAULT_FRAME_BUCKET
 _SERVING_WATCH = False
 _RECOMPILE_HOOK_INSTALLED = False
 _FEAT_ATTRS = (
@@ -262,6 +276,337 @@ class SpeechEncoderGraphFallback(RuntimeError):
     """Graph helper failed; ``__call__`` must return None (eager encode)."""
 
 
+def set_speech_encoder_shape_config(
+    runner: Any = None,
+    *,
+    window: int | None = None,
+    max_windows: int | None = None,
+    bucket_step: int | None = None,
+) -> None:
+    """Pin the flex / last-window bucket sizes from the graph runner."""
+    global _FLEX_WINDOW, _FLEX_MAX_WINDOWS, _FLEX_BUCKET_STEP
+    if window is None:
+        window = _encoder_window(runner)
+    if window:
+        _FLEX_WINDOW = max(int(window), 1)
+    if max_windows is None and runner is not None:
+        raw = getattr(runner, "max_windows", None)
+        if raw:
+            max_windows = int(raw)
+    if max_windows:
+        _FLEX_MAX_WINDOWS = max(int(max_windows), 1)
+    if bucket_step is None and runner is not None:
+        bucket_step = _frame_bucket_step(runner)
+    if bucket_step:
+        _FLEX_BUCKET_STEP = max(int(bucket_step), 1)
+
+
+def speech_encoder_flex_bucket(
+    frames: int,
+    *,
+    window: int | None = None,
+    max_windows: int | None = None,
+    bucket_step: int | None = None,
+) -> int:
+    """Map a flex / window length onto the closed compile set.
+
+    Already-served 256-frame and ``n * window`` sizes stay as-is so short
+    CUDA graphs keep their warmed T. Off-bucket lengths (last-window
+    remainders from the plugin slicing on ``processed_len``) pad to
+    ``window``, the next 256-bucket, or the next ``n * window``.
+    """
+    if frames <= 0:
+        return frames
+    win = max(int(window) if window is not None else _FLEX_WINDOW, 1)
+    max_w = max(int(max_windows) if max_windows is not None else _FLEX_MAX_WINDOWS, 1)
+    step = max(int(bucket_step) if bucket_step is not None else _FLEX_BUCKET_STEP, 1)
+    short_cap = win * max_w
+    if frames <= short_cap and frames % step == 0:
+        return frames
+    if frames % win == 0:
+        return frames
+    if frames <= win:
+        return win
+    if frames <= short_cap:
+        return ((frames + step - 1) // step) * step
+    if frames % step == 0:
+        return frames
+    return ((frames + win - 1) // win) * win
+
+
+def _as_pos_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        return int(value.item())
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_encoder_path(
+    path: str, processed: torch.Tensor, processed_len: torch.Tensor
+) -> None:
+    global _LAST_ENCODER_PATH, _LAST_PROCESSED_SHAPE, _LAST_PROCESSED_LEN
+    _LAST_ENCODER_PATH = path
+    if isinstance(processed, torch.Tensor):
+        _LAST_PROCESSED_SHAPE = tuple(int(s) for s in processed.shape)
+    else:
+        _LAST_PROCESSED_SHAPE = None
+    if isinstance(processed_len, torch.Tensor) and processed_len.numel() > 0:
+        _LAST_PROCESSED_LEN = int(processed_len.max().item())
+    else:
+        _LAST_PROCESSED_LEN = None
+
+
+def _record_flex_input(
+    q: torch.Tensor,
+    block_mask: Any,
+    *,
+    orig_t: int,
+    bucket: int,
+) -> None:
+    _LAST_FLEX_INPUT.clear()
+    _LAST_FLEX_INPUT.update(
+        q_shape=tuple(int(s) for s in q.shape),
+        q_stride=tuple(int(s) for s in q.stride()),
+        q_dtype=str(q.dtype),
+        q_contig=bool(q.is_contiguous()),
+        orig_t=orig_t,
+        bucket=bucket,
+        path=_LAST_ENCODER_PATH,
+        processed=_LAST_PROCESSED_SHAPE,
+        processed_len=_LAST_PROCESSED_LEN,
+        block_mask_seq=getattr(block_mask, "seq_lengths", None),
+    )
+
+
+def _recompile_watch_context() -> str:
+    extra = (
+        f"path={_LAST_ENCODER_PATH} processed={_LAST_PROCESSED_SHAPE} "
+        f"len={_LAST_PROCESSED_LEN} flex_q={_LAST_FLEX_INPUT.get('q_shape')} "
+        f"stride={_LAST_FLEX_INPUT.get('q_stride')} "
+        f"contig={_LAST_FLEX_INPUT.get('q_contig')} "
+        f"bucket={_LAST_FLEX_INPUT.get('bucket')} "
+        f"mask={_LAST_FLEX_INPUT.get('block_mask_seq')}"
+    )
+    if _SERVING_WATCH:
+        logger.warning("Speech encoder dynamo recompile after warmup; %s", extra)
+    return extra[:256]
+
+
+def _pad_flex_qkv(tensor: torch.Tensor, target: int) -> torch.Tensor:
+    cur = tensor.shape[-2]
+    if target <= cur:
+        return tensor.contiguous()
+    return torch.nn.functional.pad(tensor, (0, 0, 0, target - cur)).contiguous()
+
+
+def _crop_flex_output(out: Any, orig_t: int) -> Any:
+    if isinstance(out, tuple):
+        if not out:
+            return out
+        head, *rest = out
+        if isinstance(head, torch.Tensor) and head.shape[-2] > orig_t:
+            return (head[..., :orig_t, :], *rest)
+        return out
+    if isinstance(out, torch.Tensor) and out.shape[-2] > orig_t:
+        return out[..., :orig_t, :]
+    return out
+
+
+def _flex_qkv_from_call(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[Any, Any, Any]:
+    q = kwargs["query"] if "query" in kwargs else (args[0] if args else None)
+    k = kwargs["key"] if "key" in kwargs else (args[1] if len(args) > 1 else None)
+    v = kwargs["value"] if "value" in kwargs else (args[2] if len(args) > 2 else None)
+    return q, k, v
+
+
+def _set_flex_qkv(
+    args: list[Any],
+    kwargs: dict[str, Any],
+    q: Any,
+    k: Any,
+    v: Any,
+) -> None:
+    if "query" in kwargs:
+        kwargs["query"] = q
+    elif args:
+        args[0] = q
+    if "key" in kwargs:
+        kwargs["key"] = k
+    elif len(args) > 1:
+        args[1] = k
+    if "value" in kwargs:
+        kwargs["value"] = v
+    elif len(args) > 2:
+        args[2] = v
+
+
+def _create_block_mask_impl() -> Any:
+    if _UNWRAPPED_CREATE_BLOCK_MASK is not None:
+        return _UNWRAPPED_CREATE_BLOCK_MASK
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+    except ImportError:
+        return None
+    return create_block_mask
+
+
+def _align_block_mask(mask: Any, orig_t: int, bucket: int, q: torch.Tensor) -> Any:
+    """Return a ``bucket``-sized mask whose valid region is ``0..orig_t``."""
+    if bucket <= orig_t:
+        return mask
+    seq = getattr(mask, "seq_lengths", None)
+    if seq is not None:
+        with contextlib.suppress(Exception):
+            if int(seq[0]) == bucket and int(seq[1]) == bucket:
+                return mask
+    create = _create_block_mask_impl()
+    if create is None:
+        return None
+    mask_mod = getattr(mask, "mask_mod", None) if mask is not None else None
+
+    def padded_mod(b: Any, h: Any, q_idx: Any, kv_idx: Any):
+        in_orig = (q_idx < orig_t) & (kv_idx < orig_t)
+        if mask_mod is None:
+            return in_orig
+        return in_orig & mask_mod(b, h, q_idx, kv_idx)
+
+    device = q.device if isinstance(q, torch.Tensor) else None
+    batch = int(q.shape[0]) if isinstance(q, torch.Tensor) else 1
+    heads = None
+    if isinstance(q, torch.Tensor) and q.ndim >= 4:
+        heads = int(q.shape[1])
+    try:
+        return create(padded_mod, batch, heads, bucket, bucket, device=device)
+    except Exception:
+        return None
+
+
+def _wrap_create_block_mask(create_mask: Any) -> Any:
+    """Force CUDA + closed-set Q/KV lengths on ``create_block_mask``."""
+    global _UNWRAPPED_CREATE_BLOCK_MASK
+    if create_mask is None or getattr(create_mask, _FLEX_ISOLATED_ATTR, False):
+        return create_mask
+    _UNWRAPPED_CREATE_BLOCK_MASK = create_mask
+
+    def wrapped(
+        mask_mod: Any,
+        B: Any,
+        H: Any,
+        Q_LEN: Any,
+        KV_LEN: Any,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        if kwargs.get("device") is None:
+            with contextlib.suppress(Exception):
+                kwargs["device"] = torch.device("cuda")
+        q_len = _as_pos_int(Q_LEN)
+        kv_len = _as_pos_int(KV_LEN)
+        if q_len is None or kv_len is None or q_len <= 0 or kv_len <= 0:
+            return create_mask(mask_mod, B, H, Q_LEN, KV_LEN, *args, **kwargs)
+        bq = speech_encoder_flex_bucket(q_len)
+        bk = speech_encoder_flex_bucket(kv_len)
+        if bq == q_len and bk == kv_len:
+            return create_mask(mask_mod, B, H, Q_LEN, KV_LEN, *args, **kwargs)
+
+        def padded_mod(b: Any, h: Any, q_idx: Any, kv_idx: Any):
+            in_orig = (q_idx < q_len) & (kv_idx < kv_len)
+            if mask_mod is None:
+                return in_orig
+            return in_orig & mask_mod(b, h, q_idx, kv_idx)
+
+        return create_mask(padded_mod, B, H, bq, bk, *args, **kwargs)
+
+    dynamo = getattr(torch, "_dynamo", None)
+    disable = getattr(dynamo, "disable", None) if dynamo is not None else None
+    if callable(disable):
+        with contextlib.suppress(Exception):
+            wrapped = disable(wrapped, recursive=False)
+    setattr(wrapped, _FLEX_ISOLATED_ATTR, True)
+    return wrapped
+
+
+def _call_flex_with_static_bucket(
+    fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> Any:
+    """Pad flex q/k/v + block_mask to a warmed bucket, then crop."""
+    kwargs = dict(kwargs)
+    args_list = list(args)
+    q, k, v = _flex_qkv_from_call(tuple(args_list), kwargs)
+    mask = kwargs.get("block_mask")
+    if not isinstance(q, torch.Tensor) or q.ndim < 3:
+        opts = dict(kwargs.get("kernel_options") or {})
+        opts["FORCE_USE_FLEX_ATTENTION"] = True
+        kwargs["kernel_options"] = opts
+        return fn(*args_list, **kwargs)
+    orig_t = int(q.shape[-2])
+    bucket = speech_encoder_flex_bucket(orig_t)
+    seq = getattr(mask, "seq_lengths", None)
+    if seq is not None:
+        with contextlib.suppress(Exception):
+            bucket = max(bucket, int(seq[0]), int(seq[1]))
+    _record_flex_input(q, mask, orig_t=orig_t, bucket=bucket)
+    if bucket > orig_t:
+        new_mask = _align_block_mask(mask, orig_t, bucket, q)
+        if new_mask is None:
+            opts = dict(kwargs.get("kernel_options") or {})
+            opts["FORCE_USE_FLEX_ATTENTION"] = True
+            kwargs["kernel_options"] = opts
+            return fn(*args_list, **kwargs)
+        q = _pad_flex_qkv(q, bucket)
+        if isinstance(k, torch.Tensor):
+            k = _pad_flex_qkv(k, bucket)
+        if isinstance(v, torch.Tensor):
+            v = _pad_flex_qkv(v, bucket)
+        _set_flex_qkv(args_list, kwargs, q, k, v)
+        kwargs["block_mask"] = new_mask
+    else:
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if isinstance(k, torch.Tensor) and not k.is_contiguous():
+            k = k.contiguous()
+        if isinstance(v, torch.Tensor) and not v.is_contiguous():
+            v = v.contiguous()
+        _set_flex_qkv(args_list, kwargs, q, k, v)
+    opts = dict(kwargs.get("kernel_options") or {})
+    opts["FORCE_USE_FLEX_ATTENTION"] = True
+    kwargs["kernel_options"] = opts
+    out = fn(*args_list, **kwargs)
+    if bucket > orig_t:
+        return _crop_flex_output(out, orig_t)
+    return out
+
+
+def _pad_flex_wrapper(fn: Any) -> Any:
+    """Pad flex inputs outside the compiled region (no T guard)."""
+    if fn is None or getattr(fn, _FLEX_PADDED_ATTR, False):
+        return fn
+
+    def wrapped(*args: Any, **kwargs: Any):
+        return _call_flex_with_static_bucket(fn, args, kwargs)
+
+    with contextlib.suppress(Exception):
+        wrapped = functools.update_wrapper(wrapped, fn)
+    dynamo = getattr(torch, "_dynamo", None)
+    disable = getattr(dynamo, "disable", None) if dynamo is not None else None
+    if callable(disable):
+        with contextlib.suppress(Exception):
+            wrapped = disable(wrapped, recursive=False)
+    setattr(wrapped, _FLEX_PADDED_ATTR, True)
+    setattr(wrapped, _FLEX_ISOLATED_ATTR, True)
+    return wrapped
+
+
 def _force_flex_attention_kernel(fn: Any) -> Any:
     """Wrap ``fn`` so inductor cannot pick flex-decoding for short Q."""
     if fn is None or getattr(fn, _FLEX_ISOLATED_ATTR, False):
@@ -288,7 +633,12 @@ def _patch_get_flex_attention(getter: Any) -> Any:
         return getter
 
     def wrapped(q: Any, *args: Any, **kwargs: Any):
-        return _force_flex_attention_kernel(getter(q, *args, **kwargs))
+        fn = getter(q, *args, **kwargs)
+        if getattr(fn, _BI_FLEX_COMPILED_ATTR, False) or getattr(
+            fn, _FLEX_PADDED_ATTR, False
+        ):
+            return fn
+        return _pad_flex_wrapper(_force_flex_attention_kernel(fn))
 
     with contextlib.suppress(Exception):
         wrapped = functools.update_wrapper(wrapped, getter)
@@ -344,6 +694,9 @@ def isolate_flex_attention_from_compile() -> bool:
     ``FORCE_USE_FLEX_ATTENTION`` keeps flex inside the inductor graph on
     the main kernel. Inductor's ``_use_flex_decoding`` 128-frame guard
     is short-circuited so crossing 128 frames does not recompile.
+    q/k/v and ``create_block_mask`` are padded onto static buckets
+    outside that compiled region so last-window remainders cannot
+    re-specialize.
 
     Always re-scans loaded modules so a late NeMo import is still
     patched.
@@ -375,25 +728,16 @@ def isolate_flex_attention_from_compile() -> bool:
                     continue
         wrapped_global = True
         create_mask = getattr(flex_mod, "create_block_mask", None)
-        if create_mask is not None and not getattr(
-            create_mask, _FLEX_ISOLATED_ATTR, False
-        ):
-
-            def _create_mask_on_gpu(*args: Any, **kwargs: Any):
-                if kwargs.get("device") is None:
-                    with contextlib.suppress(Exception):
-                        kwargs["device"] = torch.device("cuda")
-                return create_mask(*args, **kwargs)
-
-            setattr(_create_mask_on_gpu, _FLEX_ISOLATED_ATTR, True)
-            flex_mod.create_block_mask = _create_mask_on_gpu
+        isolated_mask = _wrap_create_block_mask(create_mask)
+        if isolated_mask is not None and isolated_mask is not create_mask:
+            flex_mod.create_block_mask = isolated_mask
             for module in list(sys.modules.values()):
                 if module is None:
                     continue
                 try:
                     if getattr(module, "create_block_mask", None) is create_mask:
                         module.create_block_mask = (  # type: ignore[attr-defined]
-                            _create_mask_on_gpu
+                            isolated_mask
                         )
                 except Exception:
                     continue
@@ -407,14 +751,14 @@ def isolate_flex_attention_from_compile() -> bool:
                 _set_module_attr(
                     module,
                     "_flex_attention_compiled",
-                    _force_flex_attention_kernel(compiled),
+                    _pad_flex_wrapper(_force_flex_attention_kernel(compiled)),
                 )
             compiled_alt = getattr(module, "flex_attention_compiled", None)
             if compiled_alt is not None:
                 _set_module_attr(
                     module,
                     "flex_attention_compiled",
-                    _force_flex_attention_kernel(compiled_alt),
+                    _pad_flex_wrapper(_force_flex_attention_kernel(compiled_alt)),
                 )
             getter = getattr(module, "_get_flex_attention", None)
             if callable(getter):
@@ -506,13 +850,14 @@ def _compile_flex_attention_under_bi(fn: Any) -> Any:
     if not options:
         return fn
     isolated = _force_flex_attention_kernel(fn)
-    compiled = torch.compile(isolated, dynamic=True, options=options)
+    compiled = torch.compile(isolated, dynamic=False, options=options)
     with contextlib.suppress(Exception):
         compiled = functools.update_wrapper(compiled, isolated)
-    setattr(compiled, _BI_FLEX_COMPILED_ATTR, True)
-    setattr(compiled, _FLEX_ISOLATED_ATTR, True)
-    _BI_FLEX_COMPILED = compiled
-    return compiled
+    padded = _pad_flex_wrapper(compiled)
+    setattr(padded, _BI_FLEX_COMPILED_ATTR, True)
+    setattr(padded, _FLEX_ISOLATED_ATTR, True)
+    _BI_FLEX_COMPILED = padded
+    return padded
 
 
 def _replace_nemo_flex_compile_under_bi() -> None:
@@ -562,12 +907,7 @@ def _install_speech_encoder_recompile_watch() -> None:
         return
 
     def hook() -> str:
-        if _SERVING_WATCH:
-            logger.warning(
-                "Speech encoder dynamo recompile after warmup; "
-                "served shapes should stay in the closed compile set."
-            )
-        return "vllm_speech_encoder"
+        return _recompile_watch_context()
 
     register_hook_for_recompile_user_context(hook)
     _RECOMPILE_HOOK_INSTALLED = True
@@ -606,12 +946,13 @@ def configure_speech_encoder_dynamo() -> None:
 def speech_encoder_layer_compile_kwargs() -> dict[str, Any]:
     """Kwargs for ``nn.Module.compile`` on speech-encoder blocks.
 
-    Always inductor + dynamic shapes. Flex stays in the graph with
-    ``FORCE_USE_FLEX_ATTENTION`` so short audio does not take
-    flex-decoding. Do not use ``backend="eager"``: dynamo then
-    captures the flex HOP as dense math (~5× slower). Under BI,
-    pass inductor ``options`` so timing autotune cannot pick
-    different tiles after a restart.
+    Always inductor + dynamic shapes on the layer. Flex is compiled
+    separately with ``dynamic=False`` after q/k/v and the block mask
+    are padded onto a closed bucket set. ``FORCE_USE_FLEX_ATTENTION``
+    keeps short audio off flex-decoding. Do not use
+    ``backend="eager"``: dynamo then captures the flex HOP as dense
+    math (~5× slower). Under BI, pass inductor ``options`` so timing
+    autotune cannot pick different tiles after a restart.
     """
     kwargs: dict[str, Any] = {"dynamic": True}
     inductor = speech_encoder_inductor_config()
@@ -856,6 +1197,7 @@ def configure_speech_encoder_graphs(
     if any(not hasattr(runner, name) for name in required):
         return False
 
+    set_speech_encoder_shape_config(runner)
     sizes = default_speech_encoder_graph_batch_sizes(vllm_config)
     current = tuple(int(b) for b in getattr(runner, "batch_sizes", ()) or ())
     hf_config = None
@@ -887,6 +1229,7 @@ def configure_speech_encoder_graphs(
         return_ctc_timestamp_inputs: bool,
     ):
         processed = _prepare_processed(processed, processed_len, runner, long=False)
+        _record_encoder_path("short", processed, processed_len)
         frames = processed.shape[2]
         bucket = runner._frame_bucket(frames)
         n_feat = processed.shape[1]
@@ -928,6 +1271,7 @@ def configure_speech_encoder_graphs(
         return_ctc_timestamp_inputs: bool,
     ):
         processed = _prepare_processed(processed, processed_len, runner, long=True)
+        _record_encoder_path("long", processed, processed_len)
         assert orig_call_long is not None
         return orig_call_long(processed, processed_len, return_ctc_timestamp_inputs)
 
@@ -1024,9 +1368,9 @@ def _compile_speech_encoder_layers(model: nn.Module, layers: list[nn.Module]) ->
         if compile_kwargs.get("options"):
             extra = ", inductor deterministic (no timing autotune)"
         logger.info(
-            "Compiled %d speech-encoder layer(s) with dynamic shapes "
-            "(compile_mm_encoder=True, backend=inductor, "
-            "FORCE_USE_FLEX_ATTENTION%s).",
+            "Compiled %d speech-encoder layer(s) with dynamic layer "
+            "shapes and static flex buckets (compile_mm_encoder=True, "
+            "backend=inductor, FORCE_USE_FLEX_ATTENTION%s).",
             compiled,
             extra,
         )
@@ -1110,34 +1454,22 @@ def _encoder_window(runner: Any) -> int | None:
 
 
 def speech_encoder_warmup_long_frames(runner: Any = None) -> list[int]:
-    """Frame lengths for long-audio window-graph warmup (BI batch 1).
+    """One 3-window dummy for long-audio window-graph warmup (BI batch 1).
 
-    Whole-forward graphs cover at most two windows. Serving pads the
-    last window to ``window``, so the closed set is every
-    ``n_windows * window`` from 3 windows through the audio cap.
-    Sparse last-width grids are not served and are not warmed.
+    Flex q/k/v and ``create_block_mask`` pad last-window remainders to
+    ``window``, so extra ``n_windows * window`` captures only inflate
+    reused-cache ready time.
     """
+    set_speech_encoder_shape_config(runner)
     window = _encoder_window(runner)
     if window is None:
         return []
-    cap = _audio_cap_frames()
     short_windows = int(getattr(runner, "max_windows", None) or _DEFAULT_MAX_WINDOWS)
-    min_n = max(_LONG_WARMUP_MIN_WINDOWS, short_windows + 1)
-    max_n = max(min_n, (cap + window - 1) // window)
-    frames: list[int] = []
-    for n_windows in range(min_n, max_n + 1):
-        length = n_windows * window
-        if length <= cap:
-            frames.append(length)
-    if len(frames) > _MAX_LONG_WARMUP_SHAPES:
-        logger.error(
-            "Speech encoder long warmup has %d n_windows shapes; "
-            "keeping the first %d. Raise the cap or window.",
-            len(frames),
-            _MAX_LONG_WARMUP_SHAPES,
-        )
-        return frames[:_MAX_LONG_WARMUP_SHAPES]
-    return frames
+    n_windows = max(_LONG_WARMUP_MIN_WINDOWS, short_windows + 1)
+    length = n_windows * window
+    if length > _audio_cap_frames():
+        return []
+    return [length]
 
 
 def _int_feat(value: Any) -> int | None:
@@ -1325,10 +1657,9 @@ def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
     """Capture graph buckets after KV. Compile-only does not dummy-encode.
 
     Under ``VLLM_BATCH_INVARIANT`` the whole-forward grid is batch 1 ×
-    frame buckets, then ``_call_long`` warms every
-    ``n_windows * window`` up to the audio cap. Serving pads remainders
-    onto that set. ``layer.compile`` already uses dynamic shapes, so
-    compile-only skips this warmup.
+    frame buckets, then ``_call_long`` warms one ``3 * window`` dummy.
+    Flex pads last-window remainders to ``window``. ``layer.compile``
+    uses dynamic shapes, so compile-only skips this warmup.
     Must not run during memory profiling.
 
     Returns:

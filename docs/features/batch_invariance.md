@@ -181,14 +181,15 @@ in the decode or prefill batch.
   `encoder_cuda_graphs`) are equivalent; they stay off unless any of
   those three is set. Under BI the default graph batch grid is `(1,)`,
   compile and capture are deferred until after KV allocation, a post-KV
-  graph warmup captures batch-1 frame buckets and every long-audio
-  `n_windows * window` graph (n_feat from the preprocessor / encoder).
-  Last windows pad to `window`. The path is a function of each item's
-  valid length. Compiled encoder / flex kernels pin inductor
+  graph warmup captures batch-1 frame buckets and one long-audio
+  `3 * window` dummy (n_feat from the preprocessor / encoder). Flex
+  q/k/v and `create_block_mask` pad last-window remainders
+  (`valid % window` from the plugin) onto that closed set and compile
+  with `dynamic=False`. The path is a function of each item's valid
+  length. Compiled encoder / flex kernels pin inductor
   `deterministic` (and disable timing `max_autotune` /
-  `coordinate_descent_tuning`) and stay on that closed shape set so
-  embeddings stay bitwise identical across process starts and after
-  later traffic.
+  `coordinate_descent_tuning`) so embeddings stay bitwise identical
+  across process starts and after later traffic.
 
 ### What you must disable (explicit errors, not silent)
 
