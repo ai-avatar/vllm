@@ -941,6 +941,73 @@ def test_flex_wrapper_makes_transposed_q_contiguous():
     assert out.shape[-2] == 279
 
 
+def test_encoder_forward_pins_compile_default_dtype():
+    """Request-time process default must not leak into encoder.forward."""
+    prev = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float32)
+        mm_encoder_mod.remember_speech_encoder_default_dtype(dtype=torch.bfloat16)
+        model = _SpeechModel()
+        seen: list[torch.dtype] = []
+
+        def orig(x):
+            seen.append(torch.get_default_dtype())
+            return x
+
+        model.perception.encoder.forward = orig
+        assert mm_encoder_mod._wrap_speech_encoder_inference(model)
+        model.perception.encoder.forward(torch.zeros(1, 4))
+        assert seen == [torch.bfloat16]
+        assert torch.get_default_dtype() == torch.float32
+    finally:
+        torch.set_default_dtype(prev)
+        mm_encoder_mod._ENCODER_DEFAULT_DTYPE = None
+
+
+def test_no_recompile_when_request_default_dtype_differs_from_warmup():
+    """Warm under model dtype, run under process default; 0 new graphs."""
+    from torch._dynamo.utils import counters
+
+    prev = torch.get_default_dtype()
+    try:
+        mm_encoder_mod.remember_speech_encoder_default_dtype(dtype=torch.bfloat16)
+        weight = torch.randn(8, 8, dtype=torch.bfloat16)
+
+        def inner(x: torch.Tensor) -> torch.Tensor:
+            extra = torch.zeros(x.shape[0], 8, device=x.device, dtype=x.dtype)
+            return x @ weight + extra
+
+        x = torch.zeros(1, 8, dtype=torch.bfloat16)
+        torch._dynamo.reset()
+        counters.clear()
+        with mm_encoder_mod.speech_encoder_global_state():
+            compiled = torch.compile(inner, dynamic=False, backend="eager")
+            compiled(x)
+        after_warmup = int(counters["stats"]["unique_graphs"])
+        assert after_warmup >= 1
+        torch.set_default_dtype(torch.float32)
+        with mm_encoder_mod.speech_encoder_global_state():
+            compiled(x)
+        assert int(counters["stats"]["unique_graphs"]) == after_warmup
+    finally:
+        torch.set_default_dtype(prev)
+        mm_encoder_mod._ENCODER_DEFAULT_DTYPE = None
+
+
+def test_recompile_watch_ignores_non_encoder_code_objects():
+    assert mm_encoder_mod._recompile_filename_is_encoder(
+        "/opt/nemo/collections/asr/modules/transformer_encoder.py"
+    )
+    assert not mm_encoder_mod._recompile_filename_is_encoder(
+        "/workspace/vllm/model_executor/layers/activation.py"
+    )
+    mm_encoder_mod._set_serving_watch(True)
+    mm_encoder_mod._LAST_ENCODER_PATH = "long"
+    mm_encoder_mod._LAST_FLEX_INPUT["bucket"] = 550
+    assert mm_encoder_mod._recompile_watch_context() == ""
+    mm_encoder_mod._set_serving_watch(False)
+
+
 def test_flex_wrapper_pads_qkv_and_crops_to_valid():
     mm_encoder_mod.set_speech_encoder_shape_config(
         window=550, max_windows=2, bucket_step=256

@@ -113,17 +113,26 @@ def _run_flex_only(args: argparse.Namespace) -> int:
     mm_encoder_mod._EAGER_FLEX = mm_encoder_mod._disable_dynamo_fn(eager_flex)
     wrapped = _pad_flex_wrapper(compiled)
 
-    def one(batch: int, t: int, *, inference: bool):
+    def _qkv(batch: int, t: int):
         q = torch.randn(batch, 16, t, 80, device=device, dtype=dtype)
+        return q, q.clone(), q.clone()
+
+    def one(batch: int, t: int, *, inference: bool):
+        q, k, v = _qkv(batch, t)
         ctx = torch.inference_mode() if inference else _nullcontext()
         with ctx:
             mm_encoder_mod._begin_encoder_mask(t)
-            return wrapped(q, q, q)
+            return wrapped(q, k, v)
 
-    print("warmup compiled buckets under inference_mode")
+    burst_ts = (1, 50, 99, 129, 400, 500, 549, 551, 1513, 1906)
+    from vllm.compilation.mm_encoder import speech_encoder_flex_bucket
+
+    warm_ts = {256, args.window, 2 * args.window, 600, *frames, *burst_ts}
+    warm_buckets = sorted({speech_encoder_flex_bucket(t) for t in warm_ts})
+    print("warmup compiled buckets under inference_mode", warm_buckets)
     torch._dynamo.reset()
     with torch.inference_mode():
-        for t in (256, args.window, 2 * args.window):
+        for t in warm_buckets:
             one(1, t, inference=True)
     after_warmup = _unique_graphs()
     print(f"  unique_graphs after warmup={after_warmup}")
@@ -150,15 +159,15 @@ def _run_flex_only(args: argparse.Namespace) -> int:
     print("compiled vs eager (B=1, inference_mode)")
     for t in frames:
         torch.manual_seed(t)
-        q = torch.randn(1, 16, t, 80, device=device, dtype=dtype)
+        q, k, v = _qkv(1, t)
         with torch.inference_mode():
             mm_encoder_mod._begin_encoder_mask(t)
-            compiled_out = wrapped(q, q, q)
+            compiled_out = wrapped(q, k, v)
             mm_encoder_mod._begin_encoder_mask(t)
             eager_out = eager_flex(
                 q,
-                q,
-                q,
+                k,
+                v,
                 kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
             )
         t_cmp = min(compiled_out.shape[-2], eager_out.shape[-2], t)
@@ -175,16 +184,16 @@ def _run_flex_only(args: argparse.Namespace) -> int:
         with torch.inference_mode():
             for t in frames:
                 torch.manual_seed(1000 + t)
-                q = torch.randn(1, 16, t, 80, device=device, dtype=dtype)
+                q, k, v = _qkv(1, t)
                 mm_encoder_mod._begin_encoder_mask(t)
-                probes[t] = (q, wrapped(q, q, q))
-            for t in (1, 50, 99, 129, 400, 500, 549, 551, 1513, 1906):
-                other = torch.randn(1, 16, t, 80, device=device, dtype=dtype)
+                probes[t] = ((q, k, v), wrapped(q, k, v))
+            for t in burst_ts:
+                oq, ok, ov = _qkv(1, t)
                 mm_encoder_mod._begin_encoder_mask(t)
-                wrapped(other, other, other)
-            for t, (q, first) in probes.items():
+                wrapped(oq, ok, ov)
+            for t, ((q, k, v), first) in probes.items():
                 mm_encoder_mod._begin_encoder_mask(t)
-                second = wrapped(q, q, q)
+                second = wrapped(q, k, v)
                 match = bool(torch.equal(first, second))
                 print(f"  T={t} bitwise={'OK' if match else 'FAIL'}")
                 if not match:
@@ -395,6 +404,11 @@ def _run_model(args: argparse.Namespace) -> int:
     for sec in args.seconds:
         frames.append(_seconds_to_frames(sec, hop))
     frames = sorted(set(int(f) for f in frames if f > 0))
+    print("eager encodings in a subprocess (before compiled engine)")
+    eager = _run_eager_subprocess(args.model, frames, n_feat)
+    if not eager.get("ok"):
+        print(f"FAIL: eager subprocess failed: {eager.get('error')}")
+        return 1
     print(f"loading compiled encoder from {args.model}")
     compiled_llm, compiled_inner = _load_vllm_encoder(
         args.model, compile_mm=True, gpu_memory_utilization=args.gpu_memory_utilization
@@ -467,19 +481,7 @@ def _run_model(args: argparse.Namespace) -> int:
             )
         mm_encoder_mod._set_serving_watch(False)
 
-    print("freeing compiled engine, then eager subprocess")
-    _shutdown_llm(compiled_llm)
-    compiled_llm = None
-    compiled_inner = None
-    gc.collect()
-    if device.type == "cuda":
-        torch.accelerator.empty_cache()
-        torch.accelerator.synchronize()
-    eager = _run_eager_subprocess(args.model, frames, n_feat)
-    if not eager.get("ok"):
-        print(f"FAIL: eager subprocess failed: {eager.get('error')}")
-        return 1
-    print("compiled vs eager (subprocess)")
+    print("compiled vs eager")
     for t in frames:
         if t not in compiled_out:
             continue
@@ -498,11 +500,15 @@ def _run_model(args: argparse.Namespace) -> int:
             traceback.print_exc()
 
     print(f"model repro done failed={failed}")
+    _shutdown_llm(compiled_llm)
     return 1 if failed else 0
 
 
 _NEMOTRON_TRANSCRIBE_TEXT = "Transcribe with punctuation and capitalization."
 _NEMOTRON_AUDIO_PLACEHOLDERS = ("<|audio|>", "<audio>", "<|AUDIO|>")
+# nemotron-api VAD / fixed chunks are 2–5 min; encoder cache is 8192 tokens.
+_E2E_CHUNK_S = 240.0
+_E2E_MAX_SINGLE_S = 300.0
 
 
 def _synth_wav(seconds: float, sr: int = 16000):
@@ -562,7 +568,7 @@ def _print_output_text(outputs) -> str:
     return str(first)
 
 
-def _audio_placeholder_from_llm(llm) -> str | None:
+def _audio_placeholder_from_llm(llm) -> str:
     tokenizer = None
     with contextlib.suppress(Exception):
         tokenizer = llm.get_tokenizer()
@@ -573,52 +579,118 @@ def _audio_placeholder_from_llm(llm) -> str | None:
     ):
         if obj is None:
             continue
-        for name in (
-            "audio_token",
-            "audio_placeholder",
-            "audio_token_id",
-            "placeholder_audio",
-        ):
+        for name in ("audio_token", "audio_placeholder", "placeholder_audio"):
             raw = getattr(obj, name, None)
             if isinstance(raw, str) and raw:
                 return raw
-    return None
+    return _NEMOTRON_AUDIO_PLACEHOLDERS[0]
 
 
-def _nemotron_e2e_prompt(llm, audio) -> dict[str, Any]:
-    """User turn with audio placeholder; no system message."""
-    text = _NEMOTRON_TRANSCRIBE_TEXT
+def _wav_data_uri(wave, sr: int) -> str:
+    import io
+    import wave as wav_mod
+
+    import numpy as np
+    import pybase64 as base64
+
+    pcm = np.clip(np.asarray(wave, dtype=np.float32) * 32767.0, -32768, 32767)
+    buf = io.BytesIO()
+    with wav_mod.open(buf, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(int(sr))
+        handle.writeframes(pcm.astype("<i2").tobytes())
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:audio/wav;base64,{encoded}"
+
+
+def _nemotron_chat_messages(wave, sr: int) -> list[dict[str, Any]]:
+    """Same user turn as nemotron-api / the HF Transcribe card: text then audio."""
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _NEMOTRON_TRANSCRIBE_TEXT},
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": _wav_data_uri(wave, sr)},
+                },
+            ],
+        }
+    ]
+
+
+def _nemotron_e2e_generate_prompt(llm, wave, sr: int) -> dict[str, Any]:
+    """Fallback generate() prompt: text then <|audio|>, no system message."""
+    ph = _audio_placeholder_from_llm(llm)
+    prompt = (
+        f"<|im_start|>user\n{_NEMOTRON_TRANSCRIBE_TEXT}{ph}"
+        f"<|im_end|>\n<|im_start|>assistant\n"
+    )
     tokenizer = None
     with contextlib.suppress(Exception):
         tokenizer = llm.get_tokenizer()
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio"},
-                    {"type": "text", "text": text},
-                ],
-            }
-        ]
         with contextlib.suppress(Exception):
             rendered = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": _NEMOTRON_TRANSCRIBE_TEXT},
+                            {"type": "audio"},
+                        ],
+                    }
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
             )
             if rendered and "audio" in rendered.lower():
-                return {"prompt": rendered, "multi_modal_data": {"audio": audio}}
-    placeholders = []
-    found = _audio_placeholder_from_llm(llm)
-    if found:
-        placeholders.append(found)
-    placeholders.extend(_NEMOTRON_AUDIO_PLACEHOLDERS)
-    ph = placeholders[0]
-    prompt = f"<|im_start|>user\n{ph}{text}<|im_end|>\n<|im_start|>assistant\n"
-    return {"prompt": prompt, "multi_modal_data": {"audio": audio}}
+                prompt = rendered
+    return {"prompt": prompt, "multi_modal_data": {"audio": (wave, sr)}}
+
+
+def _chunk_e2e_audio(seconds: float, wave, sr: int) -> list[tuple[float, Any]]:
+    """Split >5 min clips into ~4 min pieces (nemotron-api 2–5 min chunks)."""
+    import numpy as np
+
+    wave = np.asarray(wave).reshape(-1)
+    if seconds <= _E2E_MAX_SINGLE_S:
+        return [(seconds, wave)]
+    chunk = max(int(_E2E_CHUNK_S * sr), 1)
+    parts = []
+    for start in range(0, wave.size, chunk):
+        piece = wave[start : start + chunk]
+        parts.append((len(piece) / float(sr), piece))
+    print(f"  chunked {seconds}s -> {len(parts)} x ~{_E2E_CHUNK_S:.0f}s")
+    return parts
+
+
+def _e2e_one_request(llm, wave, sr: int, sampling, *, mm_kwargs=None):
+    messages = _nemotron_chat_messages(wave, sr)
+    try:
+        return llm.chat(
+            messages,
+            sampling,
+            use_tqdm=False,
+            chat_template_kwargs={"enable_thinking": False},
+            mm_processor_kwargs=mm_kwargs,
+        )
+    except TypeError:
+        return llm.chat(
+            messages,
+            sampling,
+            use_tqdm=False,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+    except Exception:
+        prompt = _nemotron_e2e_generate_prompt(llm, wave, sr)
+        return llm.generate(prompt, sampling, mm_processor_kwargs=mm_kwargs)
 
 
 def _run_e2e(args: argparse.Namespace) -> int:
-    """Offline LLM.generate for 7.9 s / 121 s / ~25 min, plain + timestamps."""
+    """Offline LLM.chat like nemotron-api: 7.9 s / 121 s / chunked long file."""
     from vllm import LLM
     from vllm.sampling_params import SamplingParams
 
@@ -642,18 +714,22 @@ def _run_e2e(args: argparse.Namespace) -> int:
     failed = 0
     for sec in seconds:
         wave, sr = _e2e_wave(sec, args.audio)
-        prompt = _nemotron_e2e_prompt(llm, (wave, sr))
+        chunks = _chunk_e2e_audio(sec, wave, sr)
         print(
-            f"--- plain {sec}s ({len(wave)} samples @ {sr}) "
-            f"prompt[:80]={prompt['prompt'][:80]!r} ---"
+            f"--- plain {sec}s ({len(wave)} samples @ {sr}, {len(chunks)} chunk(s)) ---"
         )
         try:
             before = _unique_graphs()
-            outs = llm.generate(
-                prompt,
-                SamplingParams(temperature=0.0, max_tokens=args.e2e_max_tokens),
-            )
-            text = _print_output_text(outs)
+            texts = []
+            for chunk_s, piece in chunks:
+                outs = _e2e_one_request(
+                    llm,
+                    piece,
+                    sr,
+                    SamplingParams(temperature=0.0, max_tokens=args.e2e_max_tokens),
+                )
+                texts.append(_print_output_text(outs))
+            text = " ".join(part for part in texts if part)
             after = _unique_graphs()
             print(f"  graphs {before} -> {after}")
             print(f"  text[:240]={text[:240]!r}")
@@ -669,19 +745,24 @@ def _run_e2e(args: argparse.Namespace) -> int:
         print(f"--- timestamps/verbose {sec}s ---")
         try:
             before = _unique_graphs()
-            outs = llm.generate(
-                prompt,
-                SamplingParams(
-                    temperature=0.0,
-                    max_tokens=args.e2e_max_tokens,
-                    extra_args={"return_ctc_timestamp_inputs": True},
-                ),
-                mm_processor_kwargs={
-                    "return_timestamps": True,
-                    "timestamp_granularities": ["word"],
-                },
-            )
-            text = _print_output_text(outs)
+            texts = []
+            for chunk_s, piece in chunks:
+                outs = _e2e_one_request(
+                    llm,
+                    piece,
+                    sr,
+                    SamplingParams(
+                        temperature=0.0,
+                        max_tokens=args.e2e_max_tokens,
+                        extra_args={"return_ctc_timestamp_inputs": True},
+                    ),
+                    mm_kwargs={
+                        "return_timestamps": True,
+                        "timestamp_granularities": ["word"],
+                    },
+                )
+                texts.append(_print_output_text(outs))
+            text = " ".join(part for part in texts if part)
             after = _unique_graphs()
             print(f"  graphs {before} -> {after}")
             print(f"  text[:240]={text[:240]!r}")

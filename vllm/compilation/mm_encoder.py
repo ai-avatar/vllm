@@ -89,6 +89,10 @@ _EAGER_FLEX: Any = None
 _DYNAMO_DISABLED_ATTR = "_vllm_speech_encoder_dynamo_disabled"
 _ALIGNER_ACTIVE = False
 _ENCODER_WRAP_ATTR = "_vllm_speech_encoder_inference_wrapped"
+# Model-param dtype used at compile/warmup. Request-time encoder
+# forwards must pin the same default_dtype or dynamo recompiles on
+# GLOBAL_STATE and the new graph changes embeddings.
+_ENCODER_DEFAULT_DTYPE: torch.dtype | None = None
 _LAST_ENCODER_PATH = ""
 _LAST_PROCESSED_SHAPE: tuple[int, ...] | None = None
 _LAST_PROCESSED_LEN: int | None = None
@@ -414,7 +418,57 @@ def _record_flex_input(
     )
 
 
+_ENCODER_RECOMPILE_FILE_MARKERS = (
+    "transformer_encoder",
+    "transformer_encoder_utils",
+    "nemo/collections/asr",
+    "nemo_speech",
+    "speechlm",
+)
+_ENCODER_RECOMPILE_SKIP_FUNCS = frozenset(
+    {
+        "_recompile_watch_context",
+        "_recompile_code_is_encoder",
+        "_recompile_filename_is_encoder",
+        "_install_speech_encoder_recompile_watch",
+    }
+)
+
+
+def _recompile_filename_is_encoder(filename: str) -> bool:
+    path = filename.replace("\\", "/")
+    return any(marker in path for marker in _ENCODER_RECOMPILE_FILE_MARKERS)
+
+
+def _recompile_code_is_encoder() -> bool:
+    """True only when the compiling / calling code is the speech encoder.
+
+    The dynamo user-context hook runs for every process recompile, including
+    LM CUDA-graph capture (``activation.forward_native``, ``grouped_topk``).
+    Those must not inherit the last encoder path/bucket.
+    """
+    frame: Any = sys._getframe()
+    while frame is not None:
+        code = frame.f_code
+        if code.co_name not in _ENCODER_RECOMPILE_SKIP_FUNCS:
+            if _recompile_filename_is_encoder(code.co_filename):
+                return True
+            for key in ("code", "orig_code", "frame"):
+                obj = frame.f_locals.get(key)
+                filename = getattr(obj, "co_filename", None) or getattr(
+                    getattr(obj, "f_code", None), "co_filename", None
+                )
+                if isinstance(filename, str) and _recompile_filename_is_encoder(
+                    filename
+                ):
+                    return True
+        frame = frame.f_back
+    return False
+
+
 def _recompile_watch_context() -> str:
+    if not _recompile_code_is_encoder():
+        return ""
     extra = (
         f"path={_LAST_ENCODER_PATH} processed={_LAST_PROCESSED_SHAPE} "
         f"len={_LAST_PROCESSED_LEN} flex_q={_LAST_FLEX_INPUT.get('q_shape')} "
@@ -1366,6 +1420,35 @@ def _pin_default_dtype(dtype: torch.dtype | None):
     return _Pin()
 
 
+def remember_speech_encoder_default_dtype(
+    model: Any = None, dtype: torch.dtype | None = None
+) -> torch.dtype | None:
+    """Record the compile-time default dtype for later encoder forwards."""
+    global _ENCODER_DEFAULT_DTYPE
+    if dtype is not None and dtype.is_floating_point:
+        _ENCODER_DEFAULT_DTYPE = dtype
+        return _ENCODER_DEFAULT_DTYPE
+    if model is not None:
+        inner = unwrap_speech_encoder_model(model)
+        if isinstance(inner, nn.Module):
+            found = _module_floating_dtype(inner)
+            if found is not None:
+                _ENCODER_DEFAULT_DTYPE = found
+    return _ENCODER_DEFAULT_DTYPE
+
+
+@contextlib.contextmanager
+def speech_encoder_global_state(dtype: torch.dtype | None = None):
+    """Match request-time GLOBAL_STATE to compile/warmup (default_dtype)."""
+    pin = dtype if dtype is not None else _ENCODER_DEFAULT_DTYPE
+    with _pin_default_dtype(pin):
+        yield
+
+
+def _encoder_dtype_runtime():
+    return speech_encoder_global_state(_ENCODER_DEFAULT_DTYPE)
+
+
 def _crop_to_valid_audio(
     audio_signal: torch.Tensor, audio_lengths: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1507,7 +1590,7 @@ def _wrap_speech_encoder_inference(model: Any) -> bool:
         return False
 
     def wrapped(*args: Any, **kwargs: Any):
-        with _speech_encoder_runtime():
+        with _encoder_dtype_runtime(), _speech_encoder_runtime():
             args, kwargs = _promote_to_inference(args, kwargs)
             if _ALIGNER_ACTIVE:
                 with _force_eager_compute():
@@ -1624,6 +1707,16 @@ def configure_speech_encoder_graphs(
         processed_len: torch.Tensor,
         return_ctc_timestamp_inputs: bool,
     ):
+        with _encoder_dtype_runtime():
+            return _call_short_impl(
+                processed, processed_len, return_ctc_timestamp_inputs
+            )
+
+    def _call_short_impl(
+        processed: torch.Tensor,
+        processed_len: torch.Tensor,
+        return_ctc_timestamp_inputs: bool,
+    ):
         processed = _prepare_processed(processed, processed_len, runner, long=False)
         _record_encoder_path("short", processed, processed_len)
         _prime_mask_from_processed(processed, processed_len)
@@ -1672,16 +1765,17 @@ def configure_speech_encoder_graphs(
         processed_len: torch.Tensor,
         return_ctc_timestamp_inputs: bool,
     ):
-        processed = _prepare_processed(processed, processed_len, runner, long=True)
-        _record_encoder_path("long", processed, processed_len)
-        _prime_mask_from_processed(processed, processed_len)
-        assert orig_call_long is not None
-        if return_ctc_timestamp_inputs:
-            with _aligner_runtime(), _force_eager_compute():
-                return _disable_dynamo_fn(orig_call_long)(
-                    processed, processed_len, return_ctc_timestamp_inputs
-                )
-        return orig_call_long(processed, processed_len, return_ctc_timestamp_inputs)
+        with _encoder_dtype_runtime():
+            processed = _prepare_processed(processed, processed_len, runner, long=True)
+            _record_encoder_path("long", processed, processed_len)
+            _prime_mask_from_processed(processed, processed_len)
+            assert orig_call_long is not None
+            if return_ctc_timestamp_inputs:
+                with _aligner_runtime(), _force_eager_compute():
+                    return _disable_dynamo_fn(orig_call_long)(
+                        processed, processed_len, return_ctc_timestamp_inputs
+                    )
+            return orig_call_long(processed, processed_len, return_ctc_timestamp_inputs)
 
     cls = type(runner)
     if not getattr(cls, "_vllm_speech_graph_call_wrapped", False):
@@ -2222,6 +2316,7 @@ def enable_speech_encoder_after_kv(model: nn.Module | None) -> SpeechEncoderWarm
     dtype = None
     if isinstance(inner, nn.Module):
         dtype = _module_floating_dtype(inner)
+    remember_speech_encoder_default_dtype(inner, dtype)
     with _pin_default_dtype(dtype):
         compile_pending_speech_encoder_layers(model)
         enable_speech_encoder_graph_capture(model)
@@ -2246,6 +2341,7 @@ def maybe_compile_speech_mm_encoder(
     Returns the number of layers compiled now (0 when deferred).
     """
     configure_speech_encoder_graphs(model, vllm_config)
+    remember_speech_encoder_default_dtype(model)
     _wrap_speech_encoder_inference(model)
     want_compile = bool(vllm_config.compilation_config.compile_mm_encoder)
     if want_compile or getattr(model, "_encoder_graphs", None) is not None:

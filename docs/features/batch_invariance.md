@@ -190,7 +190,9 @@ in the decode or prefill batch.
   seq_lengths; the flex wrapper is `torch.compiler.disable`'d
   (recursive) so dynamo cannot trace pad / `set_stance` into a
   compiled layer, and q/k/v are made contiguous before the compiled
-  flex call. Warmup also runs the plugin profile dummy
+  flex call. Encoder forwards pin the compile-time `default_dtype`
+  so a later process default cannot recompile on `GLOBAL_STATE`.
+  Warmup also runs the plugin profile dummy
   (`3 * max_frames` when that cap is 4000).
   The timestamp aligner is `torch.compiler.disable`'d (no new
   unique_graphs). Flex

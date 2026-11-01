@@ -119,6 +119,11 @@ seq_lengths; the flex wrapper always pads q/k/v to the bucket and
 builds a matching mask. The flex pad wrapper is `torch.compiler.disable`'d (recursive) so
 dynamo cannot trace pad / `set_stance` / mask into a compiled
 layer; q/k/v are `.contiguous()` before the compiled flex call.
+Every encoder forward pins `default_dtype` to the compile-time
+model dtype so request-time `GLOBAL_STATE` cannot recompile the
+layers (warmup used to restore float32). The post-warmup recompile
+watch only fires for encoder code objects, not LM CUDA-graph
+capture.
 The timestamp aligner is
 `torch.compiler.disable`'d so it cannot add unique_graphs. A
 profile dummy with `window=max_frames` (e.g. 4000) does not pad a
