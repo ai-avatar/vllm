@@ -420,6 +420,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
         time_after_load = time.perf_counter()
 
+        from vllm.compilation.mm_encoder import maybe_compile_speech_mm_encoder
+
+        maybe_compile_speech_mm_encoder(self.model, self.vllm_config)
+
         self.model_memory_usage = m.consumed_memory
         logger.info(
             "Model loading took %s GiB memory and %.6f seconds",

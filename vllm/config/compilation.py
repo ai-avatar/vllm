@@ -519,16 +519,27 @@ class CompilationConfig:
     If empty list [], no ops are excluded (suitable for full cudagraphs)."""
     compile_mm_encoder: bool = False
     """Whether or not to compile the multimodal encoder.
-    Currently, this only works for `Qwen2_5_vl` and `mLLaMa4` models on selected
-    platforms. It may also work for models loaded with the Transformers modeling backend
-    if the encoder is compilable. Disabled by default until more models are
-    supported/tested to work."""
+
+    Off by default. Enable with ``--compilation-config '{"compile_mm_encoder":
+    true}'`` or ``VLLM_COMPILE_MM_ENCODER=1``. In-tree vision encoders that
+    already use ``@support_torch_compile(enable_if=should_torch_compile_mm_encoder)``
+    (Qwen2.5-VL, mLLaMA4, …) compile through that decorator. NeMo SpeechLM /
+    Nemotron Transcribe perception and Sortformer blocks are compiled after
+    load with dynamic shapes. The NeMo plugin also reads hf-overrides
+    ``encoder_compile``.
+    """
 
     # Vision encoder CUDA graph
     cudagraph_mm_encoder: bool = False
     """Enable CUDA graph capture for multimodal encoder (ViT).
     When enabled, captures full encoder forward as CUDA graph
-    for each token budget level."""
+    for each token budget level.
+
+    For NeMo SpeechLM this is forwarded as hf ``encoder_cuda_graphs`` so the
+    plugin's ``EncoderGraphRunner`` captures length-bucket graphs. vLLM's
+    vision ``EncoderCudaGraphManager`` is used only when the model implements
+    ``SupportsEncoderCudaGraph``. Also enabled by ``VLLM_CUDAGRAPH_MM_ENCODER=1``.
+    """
 
     encoder_cudagraph_token_budgets: list[int] = field(default_factory=list)
     """Token budget levels for encoder CUDA graph capture.
@@ -913,6 +924,11 @@ class CompilationConfig:
         return handler(value)
 
     def __post_init__(self) -> None:
+        if envs.VLLM_COMPILE_MM_ENCODER:
+            self.compile_mm_encoder = True
+        if envs.VLLM_CUDAGRAPH_MM_ENCODER:
+            self.cudagraph_mm_encoder = True
+
         # TODO(zou3519/luka): There are 2 issues with auto-functionalization V2:
         # 1. A bug in PyTorch, fixed in 2.7:
         #    https://github.com/pytorch/pytorch/issues/147924

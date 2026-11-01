@@ -172,7 +172,10 @@ in the decode or prefill batch.
 - **Audio / multimodal encoder.** Each encoder item is encoded alone in both
   the V1 `GPUModelRunner` and the V2 `EncoderRunner`, so the NeMo plugin
   cannot pad several clips into one GEMM. Production nemotron-api uses
-  `VLLM_USE_V2_MODEL_RUNNER=0`.
+  `VLLM_USE_V2_MODEL_RUNNER=0`. Optional
+  `compile_mm_encoder` / `VLLM_COMPILE_MM_ENCODER=1` compiles those
+  per-item perception blocks with dynamic shapes; encoder CUDA graphs
+  stay off under BI unless `encoder_cuda_graphs` is set explicitly.
 
 ### What you must disable (explicit errors, not silent)
 

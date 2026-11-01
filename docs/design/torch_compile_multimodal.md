@@ -17,8 +17,22 @@ turning compile on for multimodal encoders, bringing performance improvements to
 When applied to the vision block of [`Qwen2_5_vl`](https://github.com/vllm-project/vllm/pull/23207) we observe ~4.5% e2e perf improvements with
 some increase in compilation time
 
-This feature is off by default, but can be enabled by setting `compile_mm_encoder: true` in the compilation config when models have the
-`@support_torch_compile` decorator.
+This feature is off by default. Enable it with any of:
+
+```bash
+# Official compilation_config (preferred)
+vllm serve <model> --compilation-config '{"compile_mm_encoder": true}'
+
+# Env alias (same default-off flag)
+VLLM_COMPILE_MM_ENCODER=1 vllm serve <model>
+
+# NeMo SpeechLM / Nemotron Transcribe also accept the plugin hf-overrides
+vllm serve <nemotron-transcribe> --hf-overrides '{"encoder_compile": true}'
+```
+
+In-tree vision encoders compile through `@support_torch_compile`. The NeMo
+SpeechLM perception / Sortformer towers are compiled after load (dynamic
+shapes) so variable audio lengths do not re-specialize.
 
 ## How Compilation Works for Multimodal Components
 
@@ -64,7 +78,30 @@ shape can be difficult to infer due to the unspecified range of shapes the encod
 
 ### Cudagraphs
 
-We have not yet explored compilation for multimodal encoders with CUDAGraph integration; behavior is currently unspecified.
+Vision models that implement `SupportsEncoderCudaGraph` can capture
+`cudagraph_mm_encoder` graphs through `EncoderCudaGraphManager`
+(token-budget packing). That path is unchanged.
+
+Nemotron Transcribe / NeMo SpeechLM does **not** implement that protocol.
+Setting `cudagraph_mm_encoder` (or `VLLM_CUDAGRAPH_MM_ENCODER=1`, or
+hf `encoder_cuda_graphs: true`) is forwarded to the plugin's
+`EncoderGraphRunner`, which captures length-bucket graphs and masks pad
+frames. Under `VLLM_BATCH_INVARIANT=1`, graphs are **not** auto-enabled:
+compile still runs with dynamic shapes, and per-item encode (V1 runner)
+keeps a clip's embeddings independent of the rest of the batch. Set
+`encoder_cuda_graphs: true` explicitly if you want the plugin graphs
+under BI.
+
+The recommended production path for BI is compile-only:
+
+```bash
+VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \
+vllm serve <nemotron-3.5-transcribe-bf16> \
+  --dtype bfloat16 \
+  --compilation-config '{"compile_mm_encoder": true}' \
+  --mamba-backend triton \
+  --no-enable-prefix-caching
+```
 
 ## Troubleshooting
 

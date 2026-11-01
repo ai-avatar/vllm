@@ -5118,6 +5118,12 @@ class GPUModelRunner(
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 
+                from vllm.compilation.mm_encoder import (
+                    maybe_compile_speech_mm_encoder,
+                )
+
+                maybe_compile_speech_mm_encoder(self.model, self.vllm_config)
+
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
                 # actual MoE language model but don't implement
