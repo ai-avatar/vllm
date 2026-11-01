@@ -521,12 +521,13 @@ class CompilationConfig:
     """Whether or not to compile the multimodal encoder.
 
     Off by default. Enable with ``--compilation-config '{"compile_mm_encoder":
-    true}'`` or ``VLLM_COMPILE_MM_ENCODER=1``. In-tree vision encoders that
-    already use ``@support_torch_compile(enable_if=should_torch_compile_mm_encoder)``
+    true}'`` or ``VLLM_COMPILE_MM_ENCODER=1`` (also accepts true/false).
+    In-tree vision encoders that already use
+    ``@support_torch_compile(enable_if=should_torch_compile_mm_encoder)``
     (Qwen2.5-VL, mLLaMA4, …) compile through that decorator. NeMo SpeechLM /
-    Nemotron Transcribe perception and Sortformer blocks are compiled after
-    load with dynamic shapes. The NeMo plugin also reads hf-overrides
-    ``encoder_compile``.
+    Nemotron Transcribe compiles ``perception.encoder`` blocks after load
+    with dynamic shapes (eager backend under ``VLLM_BATCH_INVARIANT``).
+    The plugin also reads hf-overrides ``encoder_compile``.
     """
 
     # Vision encoder CUDA graph
@@ -535,10 +536,11 @@ class CompilationConfig:
     When enabled, captures full encoder forward as CUDA graph
     for each token budget level.
 
-    For NeMo SpeechLM this is forwarded as hf ``encoder_cuda_graphs`` so the
-    plugin's ``EncoderGraphRunner`` captures length-bucket graphs. vLLM's
-    vision ``EncoderCudaGraphManager`` is used only when the model implements
-    ``SupportsEncoderCudaGraph``. Also enabled by ``VLLM_CUDAGRAPH_MM_ENCODER=1``.
+    For NeMo SpeechLM this is equivalent to ``VLLM_CUDAGRAPH_MM_ENCODER=1``
+    and hf ``encoder_cuda_graphs``; any of the three enables the plugin's
+    ``EncoderGraphRunner``. The effective value is written back to both
+    configs. vLLM's vision ``EncoderCudaGraphManager`` is used only when
+    the model implements ``SupportsEncoderCudaGraph``.
     """
 
     encoder_cudagraph_token_budgets: list[int] = field(default_factory=list)

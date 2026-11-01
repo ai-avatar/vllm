@@ -31,8 +31,10 @@ vllm serve <nemotron-transcribe> --hf-overrides '{"encoder_compile": true}'
 ```
 
 In-tree vision encoders compile through `@support_torch_compile`. The NeMo
-SpeechLM perception / Sortformer towers are compiled after load (dynamic
-shapes) so variable audio lengths do not re-specialize.
+SpeechLM `perception.encoder` transformer blocks (including Sortformer when
+the plugin mounts it there) are compiled after load with dynamic shapes so
+variable audio lengths do not re-specialize. The projector /
+`modality_adapter` stay eager.
 
 ## How Compilation Works for Multimodal Components
 
@@ -83,16 +85,21 @@ Vision models that implement `SupportsEncoderCudaGraph` can capture
 (token-budget packing). That path is unchanged.
 
 Nemotron Transcribe / NeMo SpeechLM does **not** implement that protocol.
-Setting `cudagraph_mm_encoder` (or `VLLM_CUDAGRAPH_MM_ENCODER=1`, or
-hf `encoder_cuda_graphs: true`) is forwarded to the plugin's
-`EncoderGraphRunner`, which captures length-bucket graphs and masks pad
-frames. Under `VLLM_BATCH_INVARIANT=1`, graphs are **not** auto-enabled:
-compile still runs with dynamic shapes, and per-item encode (V1 runner)
-keeps a clip's embeddings independent of the rest of the batch. Set
-`encoder_cuda_graphs: true` explicitly if you want the plugin graphs
-under BI.
+These three flags are equivalent and all enable the plugin's
+`EncoderGraphRunner` (length-bucket graphs, pad + mask):
 
-The recommended production path for BI is compile-only:
+```bash
+--compilation-config '{"cudagraph_mm_encoder": true}'
+VLLM_CUDAGRAPH_MM_ENCODER=1   # also accepts true/false
+--hf-overrides '{"encoder_cuda_graphs": true}'
+```
+
+The effective value is written back to both `compilation_config` and the
+SpeechLM hf config. Graphs pad to buckets; per-item encode under
+`VLLM_BATCH_INVARIANT=1` still keeps a clip independent of the rest of
+the batch. Confirm embeddings vs eager if you turn graphs on.
+
+The recommended production path for BI is compile-only (no graphs):
 
 ```bash
 VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \

@@ -4,16 +4,16 @@
 
 vLLM already compiles in-tree vision encoders via ``@support_torch_compile``
 and ``should_torch_compile_mm_encoder``. The NeMo SpeechLM plugin's
-perception / Sortformer towers are built outside that decorator. This
-module compiles their transformer blocks with dynamic shapes so variable
-audio lengths do not re-specialize, and it maps the official compilation
-flags onto the plugin's ``encoder_compile`` / ``encoder_cuda_graphs``
-hf-overrides.
+perception encoder is built outside that decorator. This module compiles
+``perception.encoder`` transformer blocks (the same set as the plugin's
+``EncoderGraphRunner``) with dynamic shapes so variable audio lengths do
+not re-specialize, and it maps the official compilation flags onto the
+plugin's ``encoder_compile`` / ``encoder_cuda_graphs`` hf-overrides.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch.nn as nn
 
@@ -55,10 +55,10 @@ def sync_mm_encoder_compile_flags(vllm_config: VllmConfig) -> None:
     * ``VLLM_COMPILE_MM_ENCODER`` / ``VLLM_CUDAGRAPH_MM_ENCODER``
     * hf-overrides ``encoder_compile`` / ``encoder_cuda_graphs``
 
-    Official compilation flags are written back onto the SpeechLM hf config
-    so the plugin's ``EncoderGraphRunner`` sees them. CUDA graphs stay off
-    under batch-invariant mode unless the user set ``encoder_cuda_graphs``
-    explicitly (graphs pad to length buckets).
+    All three graph sources are equivalent, including under
+    ``VLLM_BATCH_INVARIANT``. The effective value is written back to both
+    ``compilation_config.cudagraph_mm_encoder`` and (for SpeechLM)
+    ``hf_config.encoder_cuda_graphs`` so they match what will run.
     """
     compilation = vllm_config.compilation_config
     if envs.VLLM_COMPILE_MM_ENCODER:
@@ -74,8 +74,7 @@ def sync_mm_encoder_compile_flags(vllm_config: VllmConfig) -> None:
 
     if getattr(hf_config, "encoder_compile", False):
         compilation.compile_mm_encoder = True
-    explicit_graphs = bool(getattr(hf_config, "encoder_cuda_graphs", False))
-    if explicit_graphs:
+    if getattr(hf_config, "encoder_cuda_graphs", False):
         compilation.cudagraph_mm_encoder = True
 
     if not is_nemo_speechlm_config(hf_config):
@@ -84,43 +83,64 @@ def sync_mm_encoder_compile_flags(vllm_config: VllmConfig) -> None:
     if compilation.compile_mm_encoder:
         hf_config.encoder_compile = True
 
-    if compilation.cudagraph_mm_encoder:
-        if envs.VLLM_BATCH_INVARIANT and not explicit_graphs:
-            logger.warning(
-                "cudagraph_mm_encoder is ignored under VLLM_BATCH_INVARIANT "
-                "unless hf-overrides set encoder_cuda_graphs=true. Compile "
-                "still runs with dynamic shapes; graphs pad to length buckets."
-            )
-        else:
-            hf_config.encoder_cuda_graphs = True
+    want_graphs = bool(compilation.cudagraph_mm_encoder)
+    compilation.cudagraph_mm_encoder = want_graphs
+    hf_config.encoder_cuda_graphs = want_graphs
+    if want_graphs:
+        logger.warning_once(
+            "Speech encoder CUDA graphs pad to length buckets and mask "
+            "by length. VLLM_BATCH_INVARIANT still encodes one item at a "
+            "time. Confirm embeddings vs eager if you enable graphs."
+        )
+
+
+def speech_encoder_layer_compile_kwargs() -> dict[str, Any]:
+    """Kwargs for ``nn.Module.compile`` on speech-encoder blocks.
+
+    Under ``VLLM_BATCH_INVARIANT``, use the eager backend. Inductor GEMM
+    templates emit their own Triton mm and skip the ``aten::mm`` /
+    ``aten::addmm`` library impls that pin SM80 batch-invariant matmul.
+    """
+    kwargs: dict[str, Any] = {"dynamic": True}
+    if envs.VLLM_BATCH_INVARIANT:
+        kwargs["backend"] = "eager"
+    return kwargs
 
 
 def collect_speech_encoder_layers(model: nn.Module) -> list[nn.Module]:
-    """Return transformer blocks under perception / pe_encoder.
+    """Return top-level transformer blocks of ``perception.encoder``.
 
-    Matches the NeMo Speech plugin's ``EncoderGraphRunner`` compile loop:
-    every ``nn.ModuleList`` whose name ends with ``layers``.
+    Matches the NeMo Speech plugin's ``EncoderGraphRunner`` compile loop
+    (``perception.encoder.named_modules()`` lists named ``layers``), but
+    skips nested ``*.layers.*.layers`` so a block is not compiled again
+    as a child of an already-selected parent. ``perception.proj`` /
+    ``modality_adapter`` stay eager. Sortformer is mounted as
+    ``perception.encoder``, not a top-level ``pe_encoder`` attribute.
     """
     getter = getattr(model, "get_mm_encoder_compile_modules", None)
     if callable(getter):
         return [module for module in getter() if isinstance(module, nn.Module)]
 
-    roots: list[nn.Module] = []
-    for attr in ("perception", "pe_encoder"):
-        root = getattr(model, attr, None)
-        if isinstance(root, nn.Module):
-            roots.append(root)
+    perception = getattr(model, "perception", None)
+    if not isinstance(perception, nn.Module):
+        return []
+    encoder = getattr(perception, "encoder", None)
+    if not isinstance(encoder, nn.Module):
+        return []
 
     layers: list[nn.Module] = []
     seen: set[int] = set()
-    for root in roots:
-        for name, module in root.named_modules():
-            if isinstance(module, nn.ModuleList) and name.endswith("layers"):
-                for layer in module:
-                    ident = id(layer)
-                    if ident not in seen:
-                        seen.add(ident)
-                        layers.append(layer)
+    for name, module in encoder.named_modules():
+        if not (isinstance(module, nn.ModuleList) and name.endswith("layers")):
+            continue
+        # "layers" or "asr_encoder.layers", not "layers.0.ffn.layers".
+        if "layers" in name.split(".")[:-1]:
+            continue
+        for layer in module:
+            ident = id(layer)
+            if ident not in seen:
+                seen.add(ident)
+                layers.append(layer)
     return layers
 
 
@@ -129,7 +149,7 @@ def maybe_compile_speech_mm_encoder(model: nn.Module, vllm_config: VllmConfig) -
 
     Returns the number of layers compiled. No-op when the flag is off, the
     plugin already built ``EncoderGraphRunner`` (it compiles those layers
-    itself), or no perception / pe_encoder layers are found.
+    itself), or ``perception.encoder`` has no layer lists.
 
     CUDA graphs are not captured here. Vision models keep using
     ``EncoderCudaGraphManager`` + ``SupportsEncoderCudaGraph``. SpeechLM
@@ -148,12 +168,13 @@ def maybe_compile_speech_mm_encoder(model: nn.Module, vllm_config: VllmConfig) -
     if not layers:
         return 0
 
+    compile_kwargs = speech_encoder_layer_compile_kwargs()
     compiled = 0
     for layer in layers:
         if getattr(layer, _COMPILED_ATTR, False):
             continue
         try:
-            layer.compile(dynamic=True)
+            layer.compile(**compile_kwargs)
         except Exception as exc:
             logger.warning(
                 "Failed to compile %s; encoder stays eager for that block: %s",
@@ -165,9 +186,11 @@ def maybe_compile_speech_mm_encoder(model: nn.Module, vllm_config: VllmConfig) -
         compiled += 1
 
     if compiled:
+        backend = compile_kwargs.get("backend", "inductor")
         logger.info(
             "Compiled %d speech-encoder layer(s) with dynamic shapes "
-            "(compile_mm_encoder=True).",
+            "(compile_mm_encoder=True, backend=%s).",
             compiled,
+            backend,
         )
     return compiled

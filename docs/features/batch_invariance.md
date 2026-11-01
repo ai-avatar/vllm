@@ -173,9 +173,14 @@ in the decode or prefill batch.
   the V1 `GPUModelRunner` and the V2 `EncoderRunner`, so the NeMo plugin
   cannot pad several clips into one GEMM. Production nemotron-api uses
   `VLLM_USE_V2_MODEL_RUNNER=0`. Optional
-  `compile_mm_encoder` / `VLLM_COMPILE_MM_ENCODER=1` compiles those
-  per-item perception blocks with dynamic shapes; encoder CUDA graphs
-  stay off under BI unless `encoder_cuda_graphs` is set explicitly.
+  `compile_mm_encoder` / `VLLM_COMPILE_MM_ENCODER=1` compiles
+  `perception.encoder` blocks with dynamic shapes. Under BI those
+  blocks use `torch.compile(..., backend="eager")` so inductor GEMM
+  templates cannot bypass the `aten::mm` / `aten::addmm` BI overrides
+  (needed on SM80 / A100). Encoder CUDA graphs
+  (`cudagraph_mm_encoder`, `VLLM_CUDAGRAPH_MM_ENCODER`, or
+  `encoder_cuda_graphs`) are equivalent; they stay off unless any of
+  those three is set.
 
 ### What you must disable (explicit errors, not silent)
 
