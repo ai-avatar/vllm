@@ -26,6 +26,7 @@ from vllm.compilation.mm_encoder import (
     speech_encoder_inductor_config,
     speech_encoder_layer_compile_kwargs,
     speech_encoder_n_feat,
+    speech_encoder_served_frames,
     speech_encoder_warmup_frame_buckets,
     speech_encoder_warmup_long_frames,
     sync_mm_encoder_compile_flags,
@@ -520,6 +521,8 @@ class _FakeGraphRunner:
         self.capture_n_feats: list[int] = []
         self.short_frames: list[int] = []
         self.long_frames: list[int] = []
+        self._vllm_closed_shapes = False
+        self._vllm_allow_capture = False
 
     def _capture_all(self, n_feat: int, dtype: torch.dtype) -> None:
         self.capture_all_calls += 1
@@ -622,12 +625,12 @@ def test_graphs_capture_lazily_after_kv_and_crop_to_length(
     assert runner(audio, lengths) == (["short"], None)
     assert runner.capture_all_calls == 0
     assert runner.capture_calls == [(1, 1792)]
-    assert runner.short_frames == [1600]
+    assert runner.short_frames == [1792]
     # Same item, padded wider: same bucket, no new capture.
     audio2 = torch.zeros(1, 8000)
     assert runner(audio2, lengths) == (["short"], None)
     assert runner.capture_calls == [(1, 1792)]
-    assert runner.short_frames == [1600, 1600]
+    assert runner.short_frames == [1792, 1792]
     envs.disable_envs_cache()
 
 
@@ -643,7 +646,7 @@ def test_graphs_path_is_per_item_under_bi(monkeypatch: pytest.MonkeyPatch):
     lengths = torch.tensor([1600, 4096])
     out = runner(audio, lengths)
     assert out == ["short", "short"]
-    assert runner.short_frames == [1600, 4096]
+    assert runner.short_frames == [1792, 4096]
     assert runner.capture_all_calls == 0
     envs.disable_envs_cache()
 
@@ -776,7 +779,23 @@ def test_compile_only_skips_dummy_encode_warmup(monkeypatch: pytest.MonkeyPatch)
     envs.disable_envs_cache()
 
 
-def test_long_warmup_frames_cover_three_windows_and_last_widths(
+def test_served_frames_pad_long_remainder_to_window(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 600)
+    envs.disable_envs_cache()
+    runner = _FakeGraphRunner()
+    runner.window = 550
+    runner.max_windows = 2
+    assert speech_encoder_served_frames(80, runner, long=False) == 256
+    assert speech_encoder_served_frames(1100, runner, long=False) == 1280
+    assert speech_encoder_served_frames(1101, runner, long=True) == 1650
+    assert speech_encoder_served_frames(3 * 550 + 50, runner, long=True) == 4 * 550
+    assert speech_encoder_served_frames(4 * 550, runner, long=True) == 4 * 550
+    envs.disable_envs_cache()
+
+
+def test_long_warmup_frames_are_every_window_count(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 160)
@@ -785,11 +804,48 @@ def test_long_warmup_frames_cover_three_windows_and_last_widths(
     runner.window = 550
     runner.max_windows = 2
     frames = speech_encoder_warmup_long_frames(runner)
-    assert frames
-    assert min(frames) > 2 * 550
-    assert 2 * 550 + 256 in frames
-    assert 3 * 550 in frames
+    assert frames == [3 * 550]
+    assert 2 * 550 + 256 not in frames
+    assert all(length % 550 == 0 for length in frames)
     assert all(length <= int(160 / 0.08) for length in frames)
+    envs.disable_envs_cache()
+
+
+def test_long_call_pads_remainder_to_window(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    envs.disable_envs_cache()
+    model = _SpeechModel()
+    runner = _FakeGraphRunner()
+    model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=False, graphs=True))
+    enable_speech_encoder_graph_capture(model)
+    processed = torch.zeros(1, 128, 3 * 550 + 50)
+    processed_len = torch.tensor([3 * 550 + 50])
+    assert runner._call_long(processed, processed_len, False) == (["long"], None)
+    assert runner.long_frames == [4 * 550]
+    envs.disable_envs_cache()
+
+
+def test_warmup_closes_serving_time_capture(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 160)
+    envs.disable_envs_cache()
+    model = _SpeechModel()
+    runner = _FakeGraphRunner()
+    runner.window = 550
+    runner.max_windows = 2
+    runner.max_frames = 1100
+    model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=False, graphs=True))
+    stats = enable_speech_encoder_after_kv(model)
+    assert stats.captured > 0
+    assert runner._vllm_closed_shapes
+    assert runner._vllm_allow_capture is False
+    n_captured = len(runner.capture_calls)
+    processed = torch.zeros(1, 128, 1101)
+    runner._call_long(processed, torch.tensor([1101]), False)
+    assert runner.long_frames[-1] == 3 * 550
+    assert len(runner.capture_calls) == n_captured
     envs.disable_envs_cache()
 
 

@@ -24,15 +24,17 @@ function of each item's valid length, not the padded tensor width.
 Layer compile is also deferred until after KV so inductor workspaces are
 not counted as peak activation. A post-KV graph warmup then captures
 every (batch, frame-bucket) using ``n_feat`` from the perception
-preprocessor / encoder, then a compact long-audio window-graph set
-(3-window dummy plus window-count / last-width variants, BI batch 1).
-Compile-only skips dummy-audio warmup (dynamic shapes).
+preprocessor / encoder, then every long-audio ``n_windows * window``
+shape (BI batch 1). Last windows are padded to ``window`` so serving
+never compiles or captures a new remainder. Compile-only skips
+dummy-audio warmup (dynamic shapes).
 Pending-compile state is stored on the unwrapped module:
 ``CUDAGraphWrapper.__getattr__`` forwards, but ``delattr`` does not.
 
 Under ``VLLM_BATCH_INVARIANT``, inductor ``deterministic`` is pinned
 on ``layer.compile`` and NeMo's flex wrapper so timing autotune cannot
-select different tiles across process starts.
+select different tiles across process starts. Served tensors are
+bucketed onto that closed set so later traffic cannot recompile.
 """
 
 from __future__ import annotations
@@ -85,9 +87,11 @@ _DEFAULT_FRAME_BUCKET = 256
 _DEFAULT_MAX_WINDOWS = 2
 # First long-audio path is 3 windows (2-window clips stay whole-forward).
 _LONG_WARMUP_MIN_WINDOWS = 3
-# Keep long-window warmup well under the ~30 s budget (I2 whole-forward
-# warmup was 10.85 s / 32 graphs).
-_MAX_LONG_WARMUP_SHAPES = 24
+# Every n_windows from 3 to the audio cap (last window always ``window``).
+# 128 * 550 frames * 80 ms ≈ 94 min, above any serve cap we use.
+_MAX_LONG_WARMUP_SHAPES = 128
+_SERVING_WATCH = False
+_RECOMPILE_HOOK_INSTALLED = False
 _FEAT_ATTRS = (
     "features",
     "n_mels",
@@ -547,10 +551,38 @@ def _replace_nemo_flex_compile_under_bi() -> None:
             continue
 
 
+def _install_speech_encoder_recompile_watch() -> None:
+    """Log dynamo recompiles after warmup (they change encoder numerics)."""
+    global _RECOMPILE_HOOK_INSTALLED
+    if _RECOMPILE_HOOK_INSTALLED:
+        return
+    try:
+        from torch._dynamo.utils import register_hook_for_recompile_user_context
+    except ImportError:
+        return
+
+    def hook() -> str:
+        if _SERVING_WATCH:
+            logger.warning(
+                "Speech encoder dynamo recompile after warmup; "
+                "served shapes should stay in the closed compile set."
+            )
+        return "vllm_speech_encoder"
+
+    register_hook_for_recompile_user_context(hook)
+    _RECOMPILE_HOOK_INSTALLED = True
+
+
+def _set_serving_watch(active: bool) -> None:
+    global _SERVING_WATCH
+    _SERVING_WATCH = bool(active)
+
+
 def configure_speech_encoder_dynamo() -> None:
     """Raise dynamo recompile limits and pin inductor under BI."""
     _apply_speech_encoder_inductor_pins()
     _replace_nemo_flex_compile_under_bi()
+    _install_speech_encoder_recompile_watch()
     global _DYNAMO_CONFIGURED
     if _DYNAMO_CONFIGURED:
         return
@@ -680,6 +712,83 @@ def _crop_processed(
     return processed
 
 
+def speech_encoder_served_frames(
+    valid: int,
+    runner: Any = None,
+    *,
+    window: int | None = None,
+    max_windows: int | None = None,
+    bucket_step: int | None = None,
+    long: bool | None = None,
+) -> int:
+    """Pad ``valid`` frames onto the closed compile / graph set.
+
+    Whole-forward uses the 256-frame buckets. The long-window path
+    pads the last window to ``window`` so remainder lengths cannot
+    trigger a serving-time recompile or lazy last-width capture.
+    """
+    if valid <= 0:
+        return valid
+    if window is None:
+        window = _encoder_window(runner)
+    if max_windows is None:
+        if runner is not None:
+            max_windows = int(
+                getattr(runner, "max_windows", None) or _DEFAULT_MAX_WINDOWS
+            )
+        else:
+            max_windows = _DEFAULT_MAX_WINDOWS
+    if bucket_step is None:
+        bucket_step = _frame_bucket_step(runner)
+    bucket_step = max(int(bucket_step), 1)
+    if window is not None:
+        win = int(window)
+        if long is None:
+            long = valid > int(max_windows) * win
+        if long:
+            return ((valid + win - 1) // win) * win
+    return ((valid + bucket_step - 1) // bucket_step) * bucket_step
+
+
+def _pad_processed(processed: torch.Tensor, target_frames: int) -> torch.Tensor:
+    if not isinstance(processed, torch.Tensor) or processed.ndim < 3:
+        return processed
+    frames = processed.shape[2]
+    if target_frames <= frames:
+        return processed
+    return torch.nn.functional.pad(processed, (0, target_frames - frames))
+
+
+def _mark_processed_frames_dynamic(processed: torch.Tensor) -> torch.Tensor:
+    if not isinstance(processed, torch.Tensor) or processed.ndim < 3:
+        return processed
+    mark = getattr(getattr(torch, "_dynamo", None), "mark_dynamic", None)
+    if mark is None:
+        return processed
+    with contextlib.suppress(Exception):
+        mark(processed, 2)
+    return processed
+
+
+def _prepare_processed(
+    processed: torch.Tensor,
+    processed_len: torch.Tensor,
+    runner: Any,
+    *,
+    long: bool,
+) -> torch.Tensor:
+    """Crop to the item, then pad to the closed served shape."""
+    processed = _crop_processed(processed, processed_len)
+    if not isinstance(processed, torch.Tensor) or processed.ndim < 3:
+        return processed
+    valid = processed.shape[2]
+    if isinstance(processed_len, torch.Tensor) and processed_len.numel() > 0:
+        valid = int(processed_len.max().item())
+    target = speech_encoder_served_frames(valid, runner, long=long)
+    processed = _pad_processed(processed, target)
+    return _mark_processed_frames_dynamic(processed)
+
+
 def _call_graph_runner_per_item(
     call: Any,
     audio_signal: torch.Tensor,
@@ -710,6 +819,13 @@ def _capture_one_graph(
     runner: Any, rows: int, frames: int, n_feat: int, dtype: torch.dtype
 ) -> None:
     configure_speech_encoder_dynamo()
+    if _SERVING_WATCH:
+        logger.warning(
+            "Speech encoder serving-time CUDA graph capture: "
+            "%d rows x %d frames (closed set should prevent this)",
+            rows,
+            frames,
+        )
     with (
         _pin_default_dtype(dtype if dtype.is_floating_point else None),
         _pin_speech_encoder_inductor(),
@@ -770,13 +886,21 @@ def configure_speech_encoder_graphs(
         processed_len: torch.Tensor,
         return_ctc_timestamp_inputs: bool,
     ):
-        processed = _crop_processed(processed, processed_len)
+        processed = _prepare_processed(processed, processed_len, runner, long=False)
         frames = processed.shape[2]
         bucket = runner._frame_bucket(frames)
         n_feat = processed.shape[1]
+        closed = getattr(runner, "_vllm_closed_shapes", False)
         for size in runner._split(processed.shape[0], bucket):
             if (size, bucket) not in runner.graphs:
-                if not getattr(runner, "_vllm_allow_capture", False):
+                if closed or not getattr(runner, "_vllm_allow_capture", False):
+                    if closed:
+                        logger.error(
+                            "Speech encoder missing closed-set graph "
+                            "%d rows x %d frames; not capturing at serve time",
+                            size,
+                            bucket,
+                        )
                     raise SpeechEncoderGraphFallback(
                         "speech encoder graph capture is not enabled yet"
                     )
@@ -792,8 +916,9 @@ def configure_speech_encoder_graphs(
                         bucket,
                         exc,
                     )
-                    runner.graphs.clear()
-                    runner.enabled = False
+                    if not closed:
+                        runner.graphs.clear()
+                        runner.enabled = False
                     raise SpeechEncoderGraphFallback(str(exc)) from exc
         return orig_call_short(processed, processed_len, return_ctc_timestamp_inputs)
 
@@ -802,7 +927,7 @@ def configure_speech_encoder_graphs(
         processed_len: torch.Tensor,
         return_ctc_timestamp_inputs: bool,
     ):
-        processed = _crop_processed(processed, processed_len)
+        processed = _prepare_processed(processed, processed_len, runner, long=True)
         assert orig_call_long is not None
         return orig_call_long(processed, processed_len, return_ctc_timestamp_inputs)
 
@@ -987,56 +1112,32 @@ def _encoder_window(runner: Any) -> int | None:
 def speech_encoder_warmup_long_frames(runner: Any = None) -> list[int]:
     """Frame lengths for long-audio window-graph warmup (BI batch 1).
 
-    Whole-forward graphs cover at most two windows. The first longer
-    item (about 2.5–3 min at 80 ms/frame) hits ``_call_long`` and
-    captures ``_ASRWindowGraphs`` / last-width variants on the spot.
-    Cover 3 windows plus a sparse ``(n_windows, last_width)`` grid up
-    to the audio cap, capped so warmup stays near 30 s.
+    Whole-forward graphs cover at most two windows. Serving pads the
+    last window to ``window``, so the closed set is every
+    ``n_windows * window`` from 3 windows through the audio cap.
+    Sparse last-width grids are not served and are not warmed.
     """
     window = _encoder_window(runner)
     if window is None:
         return []
     cap = _audio_cap_frames()
     short_windows = int(getattr(runner, "max_windows", None) or _DEFAULT_MAX_WINDOWS)
-    min_long = short_windows * window + 1
-    max_windows = max(_LONG_WARMUP_MIN_WINDOWS, (cap + window - 1) // window)
-    step = min(_frame_bucket_step(runner), window)
-    last_widths: list[int] = []
-    width = step
-    while width < window:
-        last_widths.append(width)
-        width += step
-    if window not in last_widths:
-        last_widths.append(window)
-
-    counts = [_LONG_WARMUP_MIN_WINDOWS]
-    for extra in (4, 5, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128):
-        if extra <= max_windows and extra not in counts:
-            counts.append(extra)
-    if max_windows not in counts:
-        counts.append(max_windows)
-
+    min_n = max(_LONG_WARMUP_MIN_WINDOWS, short_windows + 1)
+    max_n = max(min_n, (cap + window - 1) // window)
     frames: list[int] = []
-    for n_windows in counts:
-        for last in last_widths:
-            length = (n_windows - 1) * window + last
-            if min_long <= length <= cap:
-                frames.append(length)
-    frames = sorted(set(frames))
-    if len(frames) <= _MAX_LONG_WARMUP_SHAPES:
-        return frames
-    three_win = [f for f in frames if f <= _LONG_WARMUP_MIN_WINDOWS * window]
-    rest = [f for f in frames if f > _LONG_WARMUP_MIN_WINDOWS * window]
-    keep = _MAX_LONG_WARMUP_SHAPES - len(three_win)
-    if keep <= 0:
-        return three_win[:_MAX_LONG_WARMUP_SHAPES]
-    if keep == 1:
-        return three_win + [frames[-1]]
-    stride = max(1, len(rest) // keep)
-    picked = rest[::stride][:keep]
-    if frames[-1] not in three_win and frames[-1] not in picked:
-        picked = picked[:-1] + [frames[-1]]
-    return sorted(set(three_win + picked))
+    for n_windows in range(min_n, max_n + 1):
+        length = n_windows * window
+        if length <= cap:
+            frames.append(length)
+    if len(frames) > _MAX_LONG_WARMUP_SHAPES:
+        logger.error(
+            "Speech encoder long warmup has %d n_windows shapes; "
+            "keeping the first %d. Raise the cap or window.",
+            len(frames),
+            _MAX_LONG_WARMUP_SHAPES,
+        )
+        return frames[:_MAX_LONG_WARMUP_SHAPES]
+    return frames
 
 
 def _int_feat(value: Any) -> int | None:
@@ -1224,9 +1325,10 @@ def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
     """Capture graph buckets after KV. Compile-only does not dummy-encode.
 
     Under ``VLLM_BATCH_INVARIANT`` the whole-forward grid is batch 1 ×
-    frame buckets, then ``_call_long`` warms 3-window plus a sparse
-    window-count / last-width set up to the audio cap. ``layer.compile``
-    already uses dynamic shapes, so compile-only skips this warmup.
+    frame buckets, then ``_call_long`` warms every
+    ``n_windows * window`` up to the audio cap. Serving pads remainders
+    onto that set. ``layer.compile`` already uses dynamic shapes, so
+    compile-only skips this warmup.
     Must not run during memory profiling.
 
     Returns:
@@ -1247,9 +1349,24 @@ def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
         return stats
 
     started = time.perf_counter()
+    _set_serving_watch(False)
     with torch.inference_mode(), _pin_speech_encoder_inductor():
         stats = _warmup_graphs(runner, inner)
     stats.elapsed_s = time.perf_counter() - started
+    if (
+        envs.VLLM_BATCH_INVARIANT
+        and runner is not None
+        and getattr(runner, "graphs", None)
+    ):
+        runner._vllm_closed_shapes = True
+        runner._vllm_allow_capture = False
+        _set_serving_watch(True)
+        logger.info(
+            "Speech encoder closed compile/graph shapes after warmup "
+            "(%d graph(s), %d long-window). Serving-time capture is off.",
+            stats.captured,
+            stats.long_captured,
+        )
     logger.info(
         "Speech encoder warmup finished in %.2f s (captured %d graph(s), "
         "%d long-window, %d failure(s)).",

@@ -106,18 +106,20 @@ shorter than 128 encoder frames (10.24 s). The leftover
 deferred until after KV allocation; a post-KV graph warmup then
 captures every `(batch, frame-bucket)` (under BI: batch 1 × buckets
 up to the audio cap) using `n_feat` from the perception preprocessor
-/ encoder (`features` / `feat_in`, 128 mels here), then long-audio
-window graphs (3-window dummy plus window-count / last-width
-variants). Compile-only skips dummy-audio warmup. Warmup time is
+/ encoder (`features` / `feat_in`, 128 mels here), then every
+long-audio `n_windows * window` shape. Serving pads the last window
+to `window` so remainders cannot recompile or lazy-capture a new
+tile. Compile-only skips dummy-audio warmup. Warmup time is
 logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped
 module (`model.unwrap()` / `.runnable`) because
 `CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.
-Capture of a missing bucket after warmup is still lazy. Under
+After warmup, serving-time capture is off. Under
 `VLLM_BATCH_INVARIANT=1` the default batch grid is `(1,)`, the
-replay path is a function of each item's valid length, and inductor
+replay path is a function of each item's valid length, inductor
 timing autotune is disabled (`deterministic=True`) for
-`layer.compile` and NeMo's import-time compiled flex wrapper so
-encoder outputs do not change across server restarts.
+`layer.compile` and NeMo's import-time compiled flex wrapper, and
+served tensors stay on the warmed shape set so later traffic cannot
+change encoder numerics.
 
 ```bash
 VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \

@@ -26,6 +26,7 @@ from torch.nn.attention.flex_attention import flex_attention as _raw_flex
 from vllm.compilation.mm_encoder import (
     isolate_flex_attention_from_compile,
     speech_encoder_layer_compile_kwargs,
+    speech_encoder_served_frames,
 )
 
 _ENCODER_WINDOW = 550
@@ -148,19 +149,59 @@ def test_compiled_nemo_flex_path_matches_eager_at_t43():
     assert _rel_err(compiled[:, :valid], eager[:, :valid]) < 0.05
 
 
+def _pad_time(x: torch.Tensor, target: int) -> torch.Tensor:
+    extra = target - x.shape[1]
+    if extra <= 0:
+        return x
+    return torch.nn.functional.pad(x, (0, 0, 0, extra))
+
+
 def _encode_windows(block, x: torch.Tensor, create_block_mask):
-    """Whole-forward for <=2 windows; else chunk like ``_call_long``."""
-    frames = x.shape[1]
-    if frames <= 2 * _ENCODER_WINDOW:
-        mask = _padding_block_mask(create_block_mask, frames, frames, x.device)
-        return block(x, mask)
+    """Whole-forward for <=2 windows; else chunk like ``_call_long``.
+
+    Last windows pad to ``window`` so the compiled kernel only sees the
+    closed shape set (same as ``speech_encoder_served_frames``).
+    """
+    valid = x.shape[1]
+    if valid <= 2 * _ENCODER_WINDOW:
+        target = speech_encoder_served_frames(
+            valid,
+            window=_ENCODER_WINDOW,
+            max_windows=2,
+            bucket_step=256,
+            long=False,
+        )
+        padded = _pad_time(x, target)
+        mask = _padding_block_mask(create_block_mask, target, valid, x.device)
+        return block(padded, mask)[:, :valid]
     parts = []
-    for start in range(0, frames, _ENCODER_WINDOW):
+    for start in range(0, valid, _ENCODER_WINDOW):
         chunk = x[:, start : start + _ENCODER_WINDOW]
-        length = chunk.shape[1]
-        mask = _padding_block_mask(create_block_mask, length, length, x.device)
-        parts.append(block(chunk, mask))
+        chunk_valid = chunk.shape[1]
+        padded = _pad_time(chunk, _ENCODER_WINDOW)
+        mask = _padding_block_mask(
+            create_block_mask, _ENCODER_WINDOW, chunk_valid, x.device
+        )
+        parts.append(block(padded, mask)[:, :chunk_valid])
     return torch.cat(parts, dim=1)
+
+
+def _tensor_to_payload(tensor: torch.Tensor) -> dict[str, object]:
+    """CPU bytes only — torch tensor IPC uses SHM that dies with the child."""
+    cpu = tensor.detach().contiguous().cpu().clone()
+    raw = cpu.view(torch.uint8).reshape(-1).numpy().tobytes()
+    return {"shape": list(cpu.shape), "dtype": str(cpu.dtype), "data": raw}
+
+
+def _payload_to_tensor(payload: dict[str, object]) -> torch.Tensor:
+    shape = payload["shape"]
+    dtype_s = str(payload["dtype"]).removeprefix("torch.")
+    raw = payload["data"]
+    assert isinstance(shape, list)
+    assert isinstance(raw, (bytes, bytearray))
+    dtype = getattr(torch, dtype_s)
+    storage = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+    return storage.view(dtype).reshape(shape).clone()
 
 
 def _compiled_encoder_embeddings_worker(conn, seed: int, cache_dir: str) -> None:
@@ -193,7 +234,9 @@ def _compiled_encoder_embeddings_worker(conn, seed: int, cache_dir: str) -> None
             for frames in (_SHORT_FRAMES, _LONG_FRAMES):
                 torch.manual_seed(seed + frames)
                 x = torch.randn(1, frames, 64, device=device, dtype=dtype)
-                embs.append(_encode_windows(block, x, create_block_mask).cpu())
+                embs.append(
+                    _tensor_to_payload(_encode_windows(block, x, create_block_mask))
+                )
         conn.send({"ok": True, "embs": embs})
     except Exception as exc:
         conn.send({"ok": False, "error": f"{exc}\n{traceback.format_exc()}"})
@@ -234,9 +277,42 @@ def test_compiled_encoder_embeddings_match_across_processes():
 
     for result in results:
         assert result["ok"], result.get("error")
-    first, second = results[0]["embs"], results[1]["embs"]
+    first = [_payload_to_tensor(p) for p in results[0]["embs"]]
+    second = [_payload_to_tensor(p) for p in results[1]["embs"]]
     assert len(first) == 2
     assert first[0].shape[1] == _SHORT_FRAMES
     assert first[1].shape[1] == _LONG_FRAMES
     for left, right in zip(first, second, strict=True):
         assert torch.equal(left, right)
+
+
+def test_compiled_encoder_embeddings_stable_after_varied_burst():
+    """Same long input must match bitwise after a burst of other lengths."""
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    import vllm.envs as envs
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+    from vllm.compilation.mm_encoder import configure_speech_encoder_dynamo
+
+    envs.disable_envs_cache()
+    mm_encoder_mod._INDUCTOR_PINNED = False
+    isolate_flex_attention_from_compile()
+    configure_speech_encoder_dynamo()
+    create_block_mask = _try_create_block_mask()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    block = _NeMoStyleFlexBlock().to(device=device, dtype=dtype)
+    block.compile(**speech_encoder_layer_compile_kwargs())
+    long_x = torch.randn(1, _LONG_FRAMES, 64, device=device, dtype=dtype)
+    burst = (1, 50, 80, 129, 256, 400, 549, 551, 800, 1100, 1101, 1651, 1906, 3000)
+
+    with torch.no_grad():
+        first = _encode_windows(block, long_x, create_block_mask)
+        for frames in burst:
+            other = torch.randn(1, frames, 64, device=device, dtype=dtype)
+            _encode_windows(block, other, create_block_mask)
+        second = _encode_windows(block, long_x, create_block_mask)
+
+    assert first.shape[1] == _LONG_FRAMES
+    assert torch.equal(first, second)
+    envs.disable_envs_cache()
