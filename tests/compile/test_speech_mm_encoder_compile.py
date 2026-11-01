@@ -26,6 +26,7 @@ from vllm.compilation.mm_encoder import (
     speech_encoder_flex_bucket,
     speech_encoder_inductor_config,
     speech_encoder_layer_compile_kwargs,
+    speech_encoder_mask_mod_closes_over_tensors,
     speech_encoder_n_feat,
     speech_encoder_served_frames,
     speech_encoder_warmup_frame_buckets,
@@ -919,6 +920,106 @@ def test_create_block_mask_uses_flex_bucket():
 
     mask = create_block_mask(mod, 1, 1, 400, 400, device="cpu")
     assert tuple(int(s) for s in mask.seq_lengths) == (550, 550)
+    assert speech_encoder_mask_mod_closes_over_tensors(mask.mask_mod)
+
+
+def test_mask_mod_valid_length_is_tensor_not_int():
+    mm_encoder_mod._MASK_STATE.clear()
+    state = mm_encoder_mod._mask_state(torch.device("cpu"))
+    mm_encoder_mod._set_mask_valid_len(state, 400, 400)
+    assert speech_encoder_mask_mod_closes_over_tensors(state["mask_mod"])
+    for cell in state["mask_mod"].__closure__:
+        assert not isinstance(cell.cell_contents, int)
+    assert bool(state["mask_mod"](0, 0, torch.tensor(399), torch.tensor(399)))
+    assert not bool(state["mask_mod"](0, 0, torch.tensor(400), torch.tensor(400)))
+    mm_encoder_mod._set_mask_valid_len(state, 550, 550)
+    assert bool(state["mask_mod"](0, 0, torch.tensor(400), torch.tensor(400)))
+    assert not bool(state["mask_mod"](0, 0, torch.tensor(550), torch.tensor(550)))
+
+
+def test_flex_does_not_expand_bucket_to_oversized_mask():
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    seen: dict[str, int] = {}
+
+    def fake_flex(q, k, v, **kwargs):
+        seen["T"] = int(q.shape[-2])
+        return q
+
+    mm_encoder_mod._EAGER_FLEX = None
+    wrapped = mm_encoder_mod._pad_flex_wrapper(fake_flex)
+    q = torch.randn(1, 2, 1100, 8)
+    mask = SimpleNamespace(seq_lengths=(4000, 4000), mask_mod=None)
+    with torch.inference_mode():
+        out = wrapped(q, q, q, block_mask=mask)
+    assert seen["T"] == 1100
+    assert out.shape[-2] == 1100
+
+
+def test_aligner_path_uses_eager_flex_and_does_not_recompile():
+    from torch._dynamo.utils import counters
+
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._set_serving_watch(False)
+    seen: list[str] = []
+
+    def compiled_flex(q, k, v, **kwargs):
+        seen.append("compiled")
+        return q
+
+    def eager_flex(q, k, v, **kwargs):
+        seen.append("eager")
+        return q
+
+    compiled_flex = torch.compile(compiled_flex, dynamic=False, backend="eager")
+    mm_encoder_mod._EAGER_FLEX = eager_flex
+    wrapped = mm_encoder_mod._pad_flex_wrapper(compiled_flex)
+
+    def run(batch: int, frames: int, *, grad: bool) -> torch.Tensor:
+        q = torch.randn(batch, 2, frames, 8, requires_grad=grad)
+        k = torch.randn(batch, 2, frames, 8, requires_grad=grad)
+        v = torch.randn(batch, 2, frames, 8, requires_grad=grad)
+        return wrapped(q, k, v)
+
+    torch._dynamo.reset()
+    counters.clear()
+    with torch.inference_mode():
+        for frames in (256, 550, 768, 1100):
+            run(1, frames, grad=False)
+    after_warmup = int(counters["stats"]["unique_graphs"])
+    seen.clear()
+    q_grad = torch.randn(2, 2, 600, 8, requires_grad=True)
+    out = wrapped(q_grad, q_grad, q_grad)
+    assert out.shape[-2] == 600
+    assert seen == ["eager"]
+    assert int(counters["stats"]["unique_graphs"]) == after_warmup
+
+
+def test_timestamp_flag_enters_aligner_runtime(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    envs.disable_envs_cache()
+    model = _SpeechModel()
+    runner = _FakeGraphRunner()
+    entered: list[bool] = []
+
+    orig_long = runner._call_long
+
+    def tracking_long(processed, processed_len, return_ctc_timestamp_inputs):
+        entered.append(mm_encoder_mod._ALIGNER_ACTIVE)
+        return orig_long(processed, processed_len, return_ctc_timestamp_inputs)
+
+    runner._call_long = tracking_long  # type: ignore[method-assign]
+    model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=False, graphs=True))
+    enable_speech_encoder_graph_capture(model)
+    processed = torch.zeros(1, 128, 3 * 550 + 50)
+    processed_len = torch.tensor([3 * 550 + 50])
+    runner._call_long(processed, processed_len, True)
+    assert entered == [True]
+    envs.disable_envs_cache()
 
 
 def test_long_call_pads_remainder_to_window(monkeypatch: pytest.MonkeyPatch):

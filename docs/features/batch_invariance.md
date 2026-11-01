@@ -184,9 +184,11 @@ in the decode or prefill batch.
   graph warmup captures batch-1 frame buckets and one long-audio
   `3 * window` dummy (n_feat from the preprocessor / encoder). Flex
   q/k/v and `create_block_mask` pad last-window remainders
-  (`valid % window` from the plugin) onto that closed set and compile
-  with `dynamic=False`. The path is a function of each item's valid
-  length. Compiled encoder / flex kernels pin inductor
+  (`valid % window` from the plugin) onto that closed set.
+  `mask_mod` reads valid length from a tensor; the timestamp aligner
+  uses uncompiled FORCE_USE flex under `inference_mode`. Flex
+  compiles with `dynamic=False`. The path is a function of each item's
+  valid length. Compiled encoder / flex kernels pin inductor
   `deterministic` (and disable timing `max_autotune` /
   `coordinate_descent_tuning`) so embeddings stay bitwise identical
   across process starts and after later traffic.

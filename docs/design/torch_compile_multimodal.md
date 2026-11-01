@@ -111,9 +111,11 @@ up to the audio cap) using `n_feat` from the perception preprocessor
 / encoder (`features` / `feat_in`, 128 mels here), then one
 long-audio `3 * window` dummy. The plugin still windows by
 `processed_len`, so last-window T is `valid % window`; flex q/k/v
-and the block mask pad to `window` (or the next 256-bucket) and
-flex is compiled with `dynamic=False` so those remainders cannot
-recompile. Compile-only skips dummy-audio warmup. Warmup time is
+and the block mask pad to `window` (or the next 256-bucket).
+`mask_mod` reads the valid length from a tensor (not a Python int)
+and the timestamp aligner uses uncompiled FORCE_USE flex under
+`inference_mode`. Flex is compiled with `dynamic=False` so those
+remainders cannot recompile. Compile-only skips dummy-audio warmup. Warmup time is
 logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped
 module (`model.unwrap()` / `.runnable`) because
 `CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.

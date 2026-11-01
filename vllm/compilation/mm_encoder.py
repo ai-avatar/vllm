@@ -24,8 +24,10 @@ Dynamo then recompiles flex / ``create_block_mask`` on that remainder
 mask are padded onto a closed bucket set and NeMo's flex wrapper is
 compiled with ``dynamic=False`` so every length in ``0..cap`` hits a
 warmed kernel. Layer compile stays dynamic as a fallback for non-flex
-ops. Long-graph warmup is one 3-window dummy; remainders pad to
-``window``.
+ops. Long-graph warmup is one 3-window dummy plus the per-window
+graph; remainders pad to ``window``. The timestamp aligner uses
+uncompiled FORCE_USE flex under ``inference_mode``. ``mask_mod``
+reads valid length from a tensor so new lengths cannot recompile.
 
 Speech encoder CUDA graphs are captured lazily after KV allocation, with
 batch sizes ``(1,)`` under ``VLLM_BATCH_INVARIANT``. The replay path is a
@@ -75,10 +77,15 @@ _DYNAMO_CONFIGURED = False
 _INDUCTOR_PINNED = False
 _BI_FLEX_COMPILED: Any = None
 _UNWRAPPED_CREATE_BLOCK_MASK: Any = None
+_EAGER_FLEX: Any = None
+_ALIGNER_ACTIVE = False
 _LAST_ENCODER_PATH = ""
 _LAST_PROCESSED_SHAPE: tuple[int, ...] | None = None
 _LAST_PROCESSED_LEN: int | None = None
 _LAST_FLEX_INPUT: dict[str, Any] = {}
+# Per-device tensor valid-length + cached bucket BlockMasks. mask_mod must
+# close over these tensors (not Python ints) or dynamo guards the length.
+_MASK_STATE: dict[str, dict[str, Any]] = {}
 # getattr on CUDAGraphWrapper forwards to .runnable; delattr does not.
 # Keep a side table so pending layers survive wrap/unwrap either way.
 _PENDING_LAYERS: weakref.WeakKeyDictionary[Any, list[nn.Module]] = (
@@ -400,10 +407,104 @@ def _recompile_watch_context() -> str:
     return extra[:256]
 
 
+def _device_key(device: torch.device | str | None) -> str:
+    if device is None:
+        dev = torch.device("cpu")
+    elif isinstance(device, str):
+        dev = torch.device(device)
+    else:
+        dev = device
+    index = 0 if dev.index is None else int(dev.index)
+    return f"{dev.type}:{index}"
+
+
+def _mask_state(device: torch.device | str | None) -> dict[str, Any]:
+    """Reuse one tensor-backed mask_mod per device (no Python-int guards)."""
+    key = _device_key(device)
+    state = _MASK_STATE.get(key)
+    if state is not None:
+        return state
+    kind, _, index_s = key.partition(":")
+    dev = (
+        torch.device(kind, int(index_s or 0)) if kind != "cpu" else torch.device("cpu")
+    )
+    # Must not be inference tensors: aligner fill_s them outside inference_mode.
+    with torch.inference_mode(False):
+        valid_q = torch.zeros((), device=dev, dtype=torch.int32)
+        valid_kv = torch.zeros((), device=dev, dtype=torch.int32)
+
+    def mask_mod(_b: Any, _h: Any, q_idx: Any, kv_idx: Any):
+        return (q_idx < valid_q) & (kv_idx < valid_kv)
+
+    state = {
+        "mask_mod": mask_mod,
+        "valid_q": valid_q,
+        "valid_kv": valid_kv,
+        "masks": {},
+    }
+    _MASK_STATE[key] = state
+    return state
+
+
+def speech_encoder_mask_mod_closes_over_tensors(mask_mod: Any) -> bool:
+    """True when ``mask_mod`` valid-length cells are tensors, not ints."""
+    closure = getattr(mask_mod, "__closure__", None)
+    if not closure:
+        return False
+    saw_tensor = False
+    for cell in closure:
+        value = cell.cell_contents
+        if isinstance(value, int):
+            return False
+        if isinstance(value, torch.Tensor):
+            saw_tensor = True
+    return saw_tensor
+
+
+def _set_mask_valid_len(state: dict[str, Any], q_len: int, kv_len: int) -> None:
+    with torch.inference_mode(False):
+        state["valid_q"].fill_(int(q_len))
+        state["valid_kv"].fill_(int(kv_len))
+
+
+def _cached_block_mask(
+    bucket: int,
+    valid: int,
+    q: torch.Tensor,
+    *,
+    batch: int | None = None,
+    heads: int | None = None,
+) -> Any:
+    """Bucket-sized mask; pad tail is masked via the tensor valid length."""
+    create = _create_block_mask_impl()
+    if create is None or not isinstance(q, torch.Tensor):
+        return None
+    device = q.device
+    state = _mask_state(device)
+    _set_mask_valid_len(state, valid, valid)
+    if batch is None:
+        batch = int(q.shape[0])
+    if heads is None and q.ndim >= 4:
+        heads = int(q.shape[1])
+    cache_key = (int(bucket), int(batch), heads)
+    mask = state["masks"].get(cache_key)
+    if mask is not None:
+        return mask
+    kwargs: dict[str, Any] = {"device": device}
+    with contextlib.suppress(TypeError):
+        kwargs["separate_full_blocks"] = False
+    try:
+        mask = create(state["mask_mod"], batch, heads, bucket, bucket, **kwargs)
+    except Exception:
+        return None
+    state["masks"][cache_key] = mask
+    return mask
+
+
 def _pad_flex_qkv(tensor: torch.Tensor, target: int) -> torch.Tensor:
     cur = tensor.shape[-2]
     if target <= cur:
-        return tensor.contiguous()
+        return tensor if tensor.is_contiguous() else tensor.contiguous()
     return torch.nn.functional.pad(tensor, (0, 0, 0, target - cur)).contiguous()
 
 
@@ -460,39 +561,43 @@ def _create_block_mask_impl() -> Any:
     return create_block_mask
 
 
-def _align_block_mask(mask: Any, orig_t: int, bucket: int, q: torch.Tensor) -> Any:
-    """Return a ``bucket``-sized mask whose valid region is ``0..orig_t``."""
-    if bucket <= orig_t:
-        return mask
-    seq = getattr(mask, "seq_lengths", None)
-    if seq is not None:
-        with contextlib.suppress(Exception):
-            if int(seq[0]) == bucket and int(seq[1]) == bucket:
-                return mask
-    create = _create_block_mask_impl()
-    if create is None:
-        return None
-    mask_mod = getattr(mask, "mask_mod", None) if mask is not None else None
+def _detach_flex_tensor(tensor: Any) -> Any:
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
+    if tensor.requires_grad:
+        tensor = tensor.detach()
+    return tensor
 
-    def padded_mod(b: Any, h: Any, q_idx: Any, kv_idx: Any):
-        in_orig = (q_idx < orig_t) & (kv_idx < orig_t)
-        if mask_mod is None:
-            return in_orig
-        return in_orig & mask_mod(b, h, q_idx, kv_idx)
 
-    device = q.device if isinstance(q, torch.Tensor) else None
-    batch = int(q.shape[0]) if isinstance(q, torch.Tensor) else 1
-    heads = None
-    if isinstance(q, torch.Tensor) and q.ndim >= 4:
-        heads = int(q.shape[1])
+def _should_use_eager_flex(*tensors: Any) -> bool:
+    if _ALIGNER_ACTIVE:
+        return True
+    return any(
+        isinstance(tensor, torch.Tensor) and tensor.requires_grad for tensor in tensors
+    )
+
+
+@contextlib.contextmanager
+def _aligner_runtime():
+    """Match warmup dispatch keys: inference, no grad, pinned default dtype."""
+    global _ALIGNER_ACTIVE
+    prev = _ALIGNER_ACTIVE
+    _ALIGNER_ACTIVE = True
+    already = False
+    with contextlib.suppress(Exception):
+        already = bool(torch.is_inference_mode())
     try:
-        return create(padded_mod, batch, heads, bucket, bucket, device=device)
-    except Exception:
-        return None
+        if already:
+            yield
+            return
+        with torch.inference_mode(), torch.no_grad():
+            yield
+    finally:
+        _ALIGNER_ACTIVE = prev
 
 
 def _wrap_create_block_mask(create_mask: Any) -> Any:
-    """Force CUDA + closed-set Q/KV lengths on ``create_block_mask``."""
+    """Force CUDA + tensor-stable valid length on ``create_block_mask``."""
     global _UNWRAPPED_CREATE_BLOCK_MASK
     if create_mask is None or getattr(create_mask, _FLEX_ISOLATED_ATTR, False):
         return create_mask
@@ -516,16 +621,25 @@ def _wrap_create_block_mask(create_mask: Any) -> Any:
             return create_mask(mask_mod, B, H, Q_LEN, KV_LEN, *args, **kwargs)
         bq = speech_encoder_flex_bucket(q_len)
         bk = speech_encoder_flex_bucket(kv_len)
-        if bq == q_len and bk == kv_len:
-            return create_mask(mask_mod, B, H, Q_LEN, KV_LEN, *args, **kwargs)
-
-        def padded_mod(b: Any, h: Any, q_idx: Any, kv_idx: Any):
-            in_orig = (q_idx < q_len) & (kv_idx < kv_len)
-            if mask_mod is None:
-                return in_orig
-            return in_orig & mask_mod(b, h, q_idx, kv_idx)
-
-        return create_mask(padded_mod, B, H, bq, bk, *args, **kwargs)
+        device = kwargs.get("device")
+        batch = _as_pos_int(B) or 1
+        heads = _as_pos_int(H)
+        dummy = torch.empty(1, device=device if device is not None else "cpu")
+        mask = _cached_block_mask(
+            max(bq, bk),
+            min(q_len, kv_len),
+            dummy,
+            batch=batch,
+            heads=heads,
+        )
+        if mask is not None:
+            return mask
+        state = _mask_state(device)
+        _set_mask_valid_len(state, q_len, kv_len)
+        kwargs = dict(kwargs)
+        with contextlib.suppress(TypeError):
+            kwargs["separate_full_blocks"] = False
+        return create_mask(state["mask_mod"], B, H, bq, bk, *args, **kwargs)
 
     dynamo = getattr(torch, "_dynamo", None)
     disable = getattr(dynamo, "disable", None) if dynamo is not None else None
@@ -539,37 +653,45 @@ def _wrap_create_block_mask(create_mask: Any) -> Any:
 def _call_flex_with_static_bucket(
     fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> Any:
-    """Pad flex q/k/v + block_mask to a warmed bucket, then crop."""
+    """Pad flex q/k/v + block_mask to a warmed bucket, then crop.
+
+    Aligner / grad paths use the uncompiled FORCE_USE flex so AutogradCUDA
+    and Python-int mask closures cannot recompile into dense attention.
+    """
     kwargs = dict(kwargs)
     args_list = list(args)
     q, k, v = _flex_qkv_from_call(tuple(args_list), kwargs)
-    mask = kwargs.get("block_mask")
+    eager = _EAGER_FLEX or fn
+    use_eager = _should_use_eager_flex(q, k, v)
+    call_fn = eager if use_eager else fn
+    opts = dict(kwargs.get("kernel_options") or {})
+    opts["FORCE_USE_FLEX_ATTENTION"] = True
+    kwargs["kernel_options"] = opts
     if not isinstance(q, torch.Tensor) or q.ndim < 3:
-        opts = dict(kwargs.get("kernel_options") or {})
-        opts["FORCE_USE_FLEX_ATTENTION"] = True
-        kwargs["kernel_options"] = opts
-        return fn(*args_list, **kwargs)
+        return call_fn(*args_list, **kwargs)
+    q = _detach_flex_tensor(q)
+    k = _detach_flex_tensor(k)
+    v = _detach_flex_tensor(v)
     orig_t = int(q.shape[-2])
+    # Never grow to an incoming mask's seq_lengths (aligner 4000-frame leak).
     bucket = speech_encoder_flex_bucket(orig_t)
-    seq = getattr(mask, "seq_lengths", None)
-    if seq is not None:
-        with contextlib.suppress(Exception):
-            bucket = max(bucket, int(seq[0]), int(seq[1]))
-    _record_flex_input(q, mask, orig_t=orig_t, bucket=bucket)
+    _record_flex_input(q, kwargs.get("block_mask"), orig_t=orig_t, bucket=bucket)
     if bucket > orig_t:
-        new_mask = _align_block_mask(mask, orig_t, bucket, q)
+        new_mask = _cached_block_mask(bucket, orig_t, q)
         if new_mask is None:
-            opts = dict(kwargs.get("kernel_options") or {})
-            opts["FORCE_USE_FLEX_ATTENTION"] = True
-            kwargs["kernel_options"] = opts
-            return fn(*args_list, **kwargs)
-        q = _pad_flex_qkv(q, bucket)
-        if isinstance(k, torch.Tensor):
-            k = _pad_flex_qkv(k, bucket)
-        if isinstance(v, torch.Tensor):
-            v = _pad_flex_qkv(v, bucket)
-        _set_flex_qkv(args_list, kwargs, q, k, v)
-        kwargs["block_mask"] = new_mask
+            # Still pad + FORCE_USE; never hand a raw remainder to compile.
+            q = _pad_flex_qkv(q, bucket)
+            if isinstance(k, torch.Tensor):
+                k = _pad_flex_qkv(k, bucket)
+            if isinstance(v, torch.Tensor):
+                v = _pad_flex_qkv(v, bucket)
+        else:
+            q = _pad_flex_qkv(q, bucket)
+            if isinstance(k, torch.Tensor):
+                k = _pad_flex_qkv(k, bucket)
+            if isinstance(v, torch.Tensor):
+                v = _pad_flex_qkv(v, bucket)
+            kwargs["block_mask"] = new_mask
     else:
         if not q.is_contiguous():
             q = q.contiguous()
@@ -577,11 +699,17 @@ def _call_flex_with_static_bucket(
             k = k.contiguous()
         if isinstance(v, torch.Tensor) and not v.is_contiguous():
             v = v.contiguous()
-        _set_flex_qkv(args_list, kwargs, q, k, v)
-    opts = dict(kwargs.get("kernel_options") or {})
-    opts["FORCE_USE_FLEX_ATTENTION"] = True
-    kwargs["kernel_options"] = opts
-    out = fn(*args_list, **kwargs)
+        cached = _cached_block_mask(bucket, orig_t, q)
+        if cached is not None:
+            kwargs["block_mask"] = cached
+    _set_flex_qkv(args_list, kwargs, q, k, v)
+    dtype = q.dtype if isinstance(q, torch.Tensor) and q.is_floating_point() else None
+    with _pin_default_dtype(dtype):
+        if use_eager:
+            with _aligner_runtime():
+                out = call_fn(*args_list, **kwargs)
+        else:
+            out = call_fn(*args_list, **kwargs)
     if bucket > orig_t:
         return _crop_flex_output(out, orig_t)
     return out
@@ -696,7 +824,10 @@ def isolate_flex_attention_from_compile() -> bool:
     is short-circuited so crossing 128 frames does not recompile.
     q/k/v and ``create_block_mask`` are padded onto static buckets
     outside that compiled region so last-window remainders cannot
-    re-specialize.
+    re-specialize. ``mask_mod`` reads valid length from a captured
+    tensor, not a Python int. The timestamp aligner uses the uncompiled
+    FORCE_USE flex under ``inference_mode`` so AutogradCUDA / dtype
+    guards cannot recompile into dense attention.
 
     Always re-scans loaded modules so a late NeMo import is still
     patched.
@@ -716,6 +847,8 @@ def isolate_flex_attention_from_compile() -> bool:
     wrapped_global = False
     if fn is not None:
         isolated = _force_flex_attention_kernel(fn)
+        global _EAGER_FLEX
+        _EAGER_FLEX = isolated
         if isolated is not fn:
             flex_mod.flex_attention = isolated
             for module in list(sys.modules.values()):
@@ -850,6 +983,8 @@ def _compile_flex_attention_under_bi(fn: Any) -> Any:
     if not options:
         return fn
     isolated = _force_flex_attention_kernel(fn)
+    global _EAGER_FLEX
+    _EAGER_FLEX = isolated
     compiled = torch.compile(isolated, dynamic=False, options=options)
     with contextlib.suppress(Exception):
         compiled = functools.update_wrapper(compiled, isolated)
@@ -1230,6 +1365,11 @@ def configure_speech_encoder_graphs(
     ):
         processed = _prepare_processed(processed, processed_len, runner, long=False)
         _record_encoder_path("short", processed, processed_len)
+        if return_ctc_timestamp_inputs:
+            with _aligner_runtime():
+                return orig_call_short(
+                    processed, processed_len, return_ctc_timestamp_inputs
+                )
         frames = processed.shape[2]
         bucket = runner._frame_bucket(frames)
         n_feat = processed.shape[1]
@@ -1273,6 +1413,11 @@ def configure_speech_encoder_graphs(
         processed = _prepare_processed(processed, processed_len, runner, long=True)
         _record_encoder_path("long", processed, processed_len)
         assert orig_call_long is not None
+        if return_ctc_timestamp_inputs:
+            with _aligner_runtime():
+                return orig_call_long(
+                    processed, processed_len, return_ctc_timestamp_inputs
+                )
         return orig_call_long(processed, processed_len, return_ctc_timestamp_inputs)
 
     cls = type(runner)
@@ -1648,6 +1793,20 @@ def _warmup_long_graphs(
                 "Speech encoder long-window warmup failed for 1 x %d frames "
                 "(n_feat=%d): %s",
                 frames,
+                n_feat,
+                exc,
+            )
+    if lengths and window and (1, window) not in getattr(runner, "graphs", {}):
+        try:
+            _capture_one_graph(runner, 1, window, n_feat, dtype)
+            stats.long_captured += 1
+            stats.captured += 1
+        except Exception as exc:
+            stats.failed += 1
+            logger.error(
+                "Speech encoder window-graph warmup failed for 1 x %d frames "
+                "(n_feat=%d): %s",
+                window,
                 n_feat,
                 exc,
             )
