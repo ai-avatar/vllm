@@ -183,7 +183,10 @@ in the decode or prefill batch.
   compile and capture are deferred until after KV allocation, a post-KV
   graph warmup captures batch-1 frame buckets and long-audio window
   graphs (n_feat from the preprocessor / encoder), and the path is a
-  function of each item's valid length.
+  function of each item's valid length. Compiled encoder / flex kernels
+  pin inductor `deterministic` (and disable timing `max_autotune` /
+  `coordinate_descent_tuning`) so long-window embeddings stay bitwise
+  identical across process starts.
 
 ### What you must disable (explicit errors, not silent)
 
@@ -301,7 +304,9 @@ When batch invariance is enabled, vLLM:
    Prefill splits are aligned to the Mamba chunk size. Multimodal encoder
    items run one at a time on both the V1 and V2 runners. The MoE router
    gate (`GateLinear` `torch.mm(..., out_dtype=fp32)` on H100) is routed
-   through the batch-invariant matmul.
+   through the batch-invariant matmul. Compiled speech-encoder blocks
+   and NeMo's flex wrapper pin inductor `deterministic` so tile
+   selection is not timing-based across process starts.
 
 !!! warning
     Batch invariance under tensor parallelism is not yet supported for all-reduces whose size isn't a multiple of 16 bytes, for example a hidden size that isn't a multiple of 8 in fp16/bf16. Such tensors can switch between NCCL and custom all-reduce depending on batch size. All validated models meet this requirement.

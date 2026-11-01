@@ -7,10 +7,16 @@ NeMo calls ``_get_flex_attention(q)`` which returns import-time
 flex-decoding kernel (Q < 128 frames, ~10.24 s) is wrong for this
 encoder's rel-pos ``score_mod`` and padding ``block_mask``. These cases
 cover short clips (2–8 s at 80 ms/frame) through that NeMo call path.
-Skip on CPU.
+A two-process case checks short and long-window embeddings stay
+bitwise identical across cold compiles under BI. Skip on CPU.
 """
 
 from __future__ import annotations
+
+import multiprocessing
+import os
+import tempfile
+import traceback
 
 import pytest
 import torch
@@ -21,6 +27,10 @@ from vllm.compilation.mm_encoder import (
     isolate_flex_attention_from_compile,
     speech_encoder_layer_compile_kwargs,
 )
+
+_ENCODER_WINDOW = 550
+_SHORT_FRAMES = 80
+_LONG_FRAMES = 3 * _ENCODER_WINDOW + 256
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
@@ -136,3 +146,97 @@ def test_compiled_nemo_flex_path_matches_eager_at_t43():
         compiled = block(x, mask)
 
     assert _rel_err(compiled[:, :valid], eager[:, :valid]) < 0.05
+
+
+def _encode_windows(block, x: torch.Tensor, create_block_mask):
+    """Whole-forward for <=2 windows; else chunk like ``_call_long``."""
+    frames = x.shape[1]
+    if frames <= 2 * _ENCODER_WINDOW:
+        mask = _padding_block_mask(create_block_mask, frames, frames, x.device)
+        return block(x, mask)
+    parts = []
+    for start in range(0, frames, _ENCODER_WINDOW):
+        chunk = x[:, start : start + _ENCODER_WINDOW]
+        length = chunk.shape[1]
+        mask = _padding_block_mask(create_block_mask, length, length, x.device)
+        parts.append(block(chunk, mask))
+    return torch.cat(parts, dim=1)
+
+
+def _compiled_encoder_embeddings_worker(conn, seed: int, cache_dir: str) -> None:
+    """Fresh process: compile the encoder and encode short + long clips."""
+    try:
+        os.environ["VLLM_BATCH_INVARIANT"] = "1"
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(cache_dir, "triton")
+        import vllm.envs as envs
+        from vllm.compilation import mm_encoder as mm_encoder_mod
+        from vllm.compilation.mm_encoder import (
+            configure_speech_encoder_dynamo,
+            isolate_flex_attention_from_compile,
+            speech_encoder_layer_compile_kwargs,
+        )
+
+        envs.disable_envs_cache()
+        mm_encoder_mod._INDUCTOR_PINNED = False
+        mm_encoder_mod._BI_FLEX_COMPILED = None
+        isolate_flex_attention_from_compile()
+        configure_speech_encoder_dynamo()
+        create_block_mask = _try_create_block_mask()
+        torch.manual_seed(seed)
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        block = _NeMoStyleFlexBlock().to(device=device, dtype=dtype)
+        block.compile(**speech_encoder_layer_compile_kwargs())
+        embs = []
+        with torch.no_grad():
+            for frames in (_SHORT_FRAMES, _LONG_FRAMES):
+                torch.manual_seed(seed + frames)
+                x = torch.randn(1, frames, 64, device=device, dtype=dtype)
+                embs.append(_encode_windows(block, x, create_block_mask).cpu())
+        conn.send({"ok": True, "embs": embs})
+    except Exception as exc:
+        conn.send({"ok": False, "error": f"{exc}\n{traceback.format_exc()}"})
+    finally:
+        conn.close()
+
+
+def test_compiled_encoder_embeddings_match_across_processes():
+    """Two cold inductor compiles must match bitwise under BI.
+
+    Long-window encoder path (>2 windows) plus a short clip. Separate
+    cache dirs so this is two process starts, not a shared autotune hit.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    results = []
+    for _ in range(2):
+        cache_dir = tempfile.mkdtemp(prefix="speech-enc-bi-")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(
+            target=_compiled_encoder_embeddings_worker,
+            args=(child_conn, 0, cache_dir),
+        )
+        proc.start()
+        child_conn.close()
+        try:
+            if not parent_conn.poll(timeout=600):
+                proc.terminate()
+                proc.join(timeout=30)
+                pytest.fail("compiled encoder worker timed out")
+            results.append(parent_conn.recv())
+        finally:
+            parent_conn.close()
+            proc.join(timeout=30)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=10)
+        assert proc.exitcode == 0, results[-1]
+
+    for result in results:
+        assert result["ok"], result.get("error")
+    first, second = results[0]["embs"], results[1]["embs"]
+    assert len(first) == 2
+    assert first[0].shape[1] == _SHORT_FRAMES
+    assert first[1].shape[1] == _LONG_FRAMES
+    for left, right in zip(first, second, strict=True):
+        assert torch.equal(left, right)

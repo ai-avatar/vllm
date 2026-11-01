@@ -29,6 +29,10 @@ preprocessor / encoder, then a compact long-audio window-graph set
 Compile-only skips dummy-audio warmup (dynamic shapes).
 Pending-compile state is stored on the unwrapped module:
 ``CUDAGraphWrapper.__getattr__`` forwards, but ``delattr`` does not.
+
+Under ``VLLM_BATCH_INVARIANT``, inductor ``deterministic`` is pinned
+on ``layer.compile`` and NeMo's flex wrapper so timing autotune cannot
+select different tiles across process starts.
 """
 
 from __future__ import annotations
@@ -54,9 +58,12 @@ logger = init_logger(__name__)
 
 _COMPILED_ATTR = "_vllm_mm_encoder_compiled"
 _FLEX_ISOLATED_ATTR = "_vllm_speech_encoder_flex_isolated"
+_BI_FLEX_COMPILED_ATTR = "_vllm_speech_encoder_flex_bi_compiled"
 _RUNNER_PATCH_ATTR = "_vllm_speech_graph_patched"
 _PENDING_LAYERS_ATTR = "_vllm_speech_encoder_pending_compile"
 _DYNAMO_CONFIGURED = False
+_INDUCTOR_PINNED = False
+_BI_FLEX_COMPILED: Any = None
 # getattr on CUDAGraphWrapper forwards to .runnable; delattr does not.
 # Keep a side table so pending layers survive wrap/unwrap either way.
 _PENDING_LAYERS: weakref.WeakKeyDictionary[Any, list[nn.Module]] = (
@@ -412,11 +419,138 @@ def isolate_flex_attention_from_compile() -> bool:
                 )
         except Exception:
             continue
+    _replace_nemo_flex_compile_under_bi()
     return wrapped_global
 
 
+def speech_encoder_inductor_config() -> dict[str, Any]:
+    """Inductor flags that make compiled encoder kernels restart-stable.
+
+    Flex lowering always calls ``autotune_select_algorithm`` and times
+    BLOCK_M/N candidates unless ``config.deterministic``. GEMM
+    ``max_autotune`` / ``coordinate_descent_tuning`` do the same.
+    Different process starts can pick different tiles, so bf16
+    reduction trees diverge and long-window transcripts drift.
+    ``TORCHINDUCTOR_DETERMINISTIC=1`` alone is reset by the first
+    compiled frame (pytorch#198563); set the config keys instead.
+    """
+    if not envs.VLLM_BATCH_INVARIANT:
+        return {}
+    config: dict[str, Any] = {
+        "deterministic": True,
+        "max_autotune": False,
+        "coordinate_descent_tuning": False,
+    }
+    try:
+        from torch._inductor import config as inductor_config
+    except ImportError:
+        return config
+    if hasattr(inductor_config, "batch_invariant"):
+        config["batch_invariant"] = True
+    return config
+
+
+def _apply_speech_encoder_inductor_pins() -> dict[str, Any]:
+    """Pin process-level inductor settings under BI. Idempotent."""
+    global _INDUCTOR_PINNED
+    config = speech_encoder_inductor_config()
+    if not config:
+        return config
+    try:
+        from torch._inductor import config as inductor_config
+    except ImportError:
+        return config
+    changed = False
+    for name, value in config.items():
+        if not hasattr(inductor_config, name):
+            continue
+        if getattr(inductor_config, name) != value:
+            setattr(inductor_config, name, value)
+            changed = True
+    if changed and not _INDUCTOR_PINNED:
+        logger.info(
+            "Pinned speech-encoder inductor config under VLLM_BATCH_INVARIANT (%s).",
+            ", ".join(f"{k}={v}" for k, v in config.items()),
+        )
+    _INDUCTOR_PINNED = True
+    return config
+
+
+def _pin_speech_encoder_inductor():
+    """Keep inductor pins active around compile and first forwards."""
+    config = _apply_speech_encoder_inductor_pins()
+    if not config:
+        return contextlib.nullcontext()
+    try:
+        from torch._inductor import config as inductor_config
+    except ImportError:
+        return contextlib.nullcontext()
+    patch = {
+        key: value for key, value in config.items() if hasattr(inductor_config, key)
+    }
+    return inductor_config.patch(**patch)
+
+
+def _compile_flex_attention_under_bi(fn: Any) -> Any:
+    """Recompile NeMo's flex wrapper with deterministic inductor options."""
+    global _BI_FLEX_COMPILED
+    if fn is None or getattr(fn, _BI_FLEX_COMPILED_ATTR, False):
+        return fn
+    if _BI_FLEX_COMPILED is not None:
+        return _BI_FLEX_COMPILED
+    options = speech_encoder_inductor_config()
+    if not options:
+        return fn
+    isolated = _force_flex_attention_kernel(fn)
+    compiled = torch.compile(isolated, dynamic=True, options=options)
+    with contextlib.suppress(Exception):
+        compiled = functools.update_wrapper(compiled, isolated)
+    setattr(compiled, _BI_FLEX_COMPILED_ATTR, True)
+    setattr(compiled, _FLEX_ISOLATED_ATTR, True)
+    _BI_FLEX_COMPILED = compiled
+    return compiled
+
+
+def _replace_nemo_flex_compile_under_bi() -> None:
+    """Replace import-time ``torch.compile(flex)`` under BI.
+
+    That wrapper has no inductor options, so first invocation would
+    still time flex tiles even after ``layer.compile`` is pinned.
+    """
+    if not envs.VLLM_BATCH_INVARIANT:
+        return
+    try:
+        import torch.nn.attention.flex_attention as flex_mod
+    except ImportError:
+        return
+    source = getattr(flex_mod, "flex_attention", None)
+    if source is None:
+        return
+    compiled = _compile_flex_attention_under_bi(source)
+    if compiled is source:
+        return
+    for module in list(sys.modules.values()):
+        if module is None:
+            continue
+        try:
+            current = getattr(module, "_flex_attention_compiled", None)
+            if current is not None and not getattr(
+                current, _BI_FLEX_COMPILED_ATTR, False
+            ):
+                _set_module_attr(module, "_flex_attention_compiled", compiled)
+            current_alt = getattr(module, "flex_attention_compiled", None)
+            if current_alt is not None and not getattr(
+                current_alt, _BI_FLEX_COMPILED_ATTR, False
+            ):
+                _set_module_attr(module, "flex_attention_compiled", compiled)
+        except Exception:
+            continue
+
+
 def configure_speech_encoder_dynamo() -> None:
-    """Raise dynamo recompile limits for variable encoder window shapes."""
+    """Raise dynamo recompile limits and pin inductor under BI."""
+    _apply_speech_encoder_inductor_pins()
+    _replace_nemo_flex_compile_under_bi()
     global _DYNAMO_CONFIGURED
     if _DYNAMO_CONFIGURED:
         return
@@ -443,9 +577,15 @@ def speech_encoder_layer_compile_kwargs() -> dict[str, Any]:
     Always inductor + dynamic shapes. Flex stays in the graph with
     ``FORCE_USE_FLEX_ATTENTION`` so short audio does not take
     flex-decoding. Do not use ``backend="eager"``: dynamo then
-    captures the flex HOP as dense math (~5× slower).
+    captures the flex HOP as dense math (~5× slower). Under BI,
+    pass inductor ``options`` so timing autotune cannot pick
+    different tiles after a restart.
     """
-    return {"dynamic": True}
+    kwargs: dict[str, Any] = {"dynamic": True}
+    inductor = speech_encoder_inductor_config()
+    if inductor:
+        kwargs["options"] = inductor
+    return kwargs
 
 
 def collect_speech_encoder_layers(model: nn.Module) -> list[nn.Module]:
@@ -570,7 +710,10 @@ def _capture_one_graph(
     runner: Any, rows: int, frames: int, n_feat: int, dtype: torch.dtype
 ) -> None:
     configure_speech_encoder_dynamo()
-    with _pin_default_dtype(dtype if dtype.is_floating_point else None):
+    with (
+        _pin_default_dtype(dtype if dtype.is_floating_point else None),
+        _pin_speech_encoder_inductor(),
+    ):
         runner._capture(rows, frames, n_feat, dtype)
 
 
@@ -732,10 +875,11 @@ def enable_speech_encoder_graph_capture(model: nn.Module | None) -> None:
 
 
 def _compile_speech_encoder_layers(model: nn.Module, layers: list[nn.Module]) -> int:
+    configure_speech_encoder_dynamo()
     compile_kwargs = speech_encoder_layer_compile_kwargs()
     compiled = 0
     dtype = _module_floating_dtype(model)
-    with _pin_default_dtype(dtype):
+    with _pin_default_dtype(dtype), _pin_speech_encoder_inductor():
         for layer in layers:
             if getattr(layer, _COMPILED_ATTR, False):
                 continue
@@ -751,11 +895,15 @@ def _compile_speech_encoder_layers(model: nn.Module, layers: list[nn.Module]) ->
             setattr(layer, _COMPILED_ATTR, True)
             compiled += 1
     if compiled:
+        extra = ""
+        if compile_kwargs.get("options"):
+            extra = ", inductor deterministic (no timing autotune)"
         logger.info(
             "Compiled %d speech-encoder layer(s) with dynamic shapes "
             "(compile_mm_encoder=True, backend=inductor, "
-            "FORCE_USE_FLEX_ATTENTION).",
+            "FORCE_USE_FLEX_ATTENTION%s).",
             compiled,
+            extra,
         )
     return compiled
 
@@ -765,6 +913,7 @@ def compile_pending_speech_encoder_layers(model: nn.Module | None) -> int:
     if model is None:
         return 0
     isolate_flex_attention_from_compile()
+    configure_speech_encoder_dynamo()
     layers = _pop_pending_layers(model)
     if not layers:
         return 0
@@ -1098,7 +1247,7 @@ def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
         return stats
 
     started = time.perf_counter()
-    with torch.inference_mode():
+    with torch.inference_mode(), _pin_speech_encoder_inductor():
         stats = _warmup_graphs(runner, inner)
     stats.elapsed_s = time.perf_counter() - started
     logger.info(

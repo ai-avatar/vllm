@@ -113,8 +113,11 @@ logged and is not counted as peak activation. Pending-compile state is stored on
 module (`model.unwrap()` / `.runnable`) because
 `CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.
 Capture of a missing bucket after warmup is still lazy. Under
-`VLLM_BATCH_INVARIANT=1` the default batch grid is `(1,)` and the
-replay path is a function of each item's valid length.
+`VLLM_BATCH_INVARIANT=1` the default batch grid is `(1,)`, the
+replay path is a function of each item's valid length, and inductor
+timing autotune is disabled (`deterministic=True`) for
+`layer.compile` and NeMo's import-time compiled flex wrapper so
+encoder outputs do not change across server restarts.
 
 ```bash
 VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \

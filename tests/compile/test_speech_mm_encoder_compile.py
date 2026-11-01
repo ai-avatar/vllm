@@ -23,6 +23,7 @@ from vllm.compilation.mm_encoder import (
     is_nemo_speechlm_config,
     isolate_flex_attention_from_compile,
     maybe_compile_speech_mm_encoder,
+    speech_encoder_inductor_config,
     speech_encoder_layer_compile_kwargs,
     speech_encoder_n_feat,
     speech_encoder_warmup_frame_buckets,
@@ -249,27 +250,72 @@ def test_maybe_compile_skips_adapter_and_nested_layers():
     assert encoder.layers[0].compile_calls == 1
 
 
-def test_maybe_compile_still_compiles_when_plugin_graphs_exist():
+def test_maybe_compile_still_compiles_when_plugin_graphs_exist(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    envs.disable_envs_cache()
     model = _SpeechModel()
     model._encoder_graphs = object()
     compiled = maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=True))
     assert compiled == 3
     assert model.perception.encoder.layers[0].compile_calls == 1
     assert model.perception.encoder.layers[0].compile_kwargs == {"dynamic": True}
+    envs.disable_envs_cache()
 
 
 def test_compile_kwargs_stay_inductor_under_bi(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
     envs.disable_envs_cache()
     assert speech_encoder_layer_compile_kwargs() == {"dynamic": True}
+    assert speech_encoder_inductor_config() == {}
 
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     envs.disable_envs_cache()
-    assert speech_encoder_layer_compile_kwargs() == {"dynamic": True}
+    kwargs = speech_encoder_layer_compile_kwargs()
+    assert kwargs["dynamic"] is True
+    assert "backend" not in kwargs
+    options = kwargs["options"]
+    assert options["deterministic"] is True
+    assert options["max_autotune"] is False
+    assert options["coordinate_descent_tuning"] is False
+    assert speech_encoder_inductor_config() == options
     model = _SpeechModel()
     maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=True))
-    assert model.perception.encoder.layers[0].compile_kwargs == {"dynamic": True}
+    assert model.perception.encoder.layers[0].compile_kwargs == kwargs
     envs.disable_envs_cache()
+
+
+def test_configure_pins_inductor_deterministic_under_bi(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    envs.disable_envs_cache()
+    from torch._inductor import config as inductor_config
+
+    prev = {
+        name: getattr(inductor_config, name)
+        for name in (
+            "deterministic",
+            "max_autotune",
+            "coordinate_descent_tuning",
+            "batch_invariant",
+        )
+        if hasattr(inductor_config, name)
+    }
+    try:
+        mm_encoder_mod._INDUCTOR_PINNED = False
+        configure_speech_encoder_dynamo()
+        assert inductor_config.deterministic is True
+        assert inductor_config.max_autotune is False
+        assert inductor_config.coordinate_descent_tuning is False
+        if hasattr(inductor_config, "batch_invariant"):
+            assert inductor_config.batch_invariant is True
+    finally:
+        for name, value in prev.items():
+            setattr(inductor_config, name, value)
+        mm_encoder_mod._INDUCTOR_PINNED = False
+        envs.disable_envs_cache()
 
 
 def test_graph_batch_defaults_are_singleton_under_bi(
@@ -330,9 +376,34 @@ def test_isolate_flex_attention_marks_the_op():
     assert getattr(flex_attention, mm_encoder_mod._FLEX_ISOLATED_ATTR)
 
 
+def test_bi_recompiles_nemo_flex_wrapper(monkeypatch: pytest.MonkeyPatch):
+    import types
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    envs.disable_envs_cache()
+    mm_encoder_mod._BI_FLEX_COMPILED = None
+
+    def fake_compiled(*args, **kwargs):
+        return args[0] if args else None
+
+    fake_mod = types.ModuleType(
+        "nemo.collections.asr.modules.transformer_encoder_utils"
+    )
+    fake_mod._flex_attention_compiled = fake_compiled  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, fake_mod.__name__, fake_mod)
+    isolate_flex_attention_from_compile()
+    compiled = fake_mod._flex_attention_compiled  # type: ignore[attr-defined]
+    assert getattr(compiled, mm_encoder_mod._BI_FLEX_COMPILED_ATTR)
+    assert compiled is not fake_compiled
+    envs.disable_envs_cache()
+    mm_encoder_mod._BI_FLEX_COMPILED = None
+
+
 def test_patches_nemo_compiled_flex_wrapper(monkeypatch: pytest.MonkeyPatch):
     import types
 
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    envs.disable_envs_cache()
     recorded: dict[str, dict] = {}
 
     def fake_compiled(*args, **kwargs):
@@ -358,6 +429,7 @@ def test_patches_nemo_compiled_flex_wrapper(monkeypatch: pytest.MonkeyPatch):
     assert getattr(wrapped_get, mm_encoder_mod._FLEX_ISOLATED_ATTR)
     wrapped_get(None)(object())
     assert recorded["opts"]["FORCE_USE_FLEX_ATTENTION"] is True
+    envs.disable_envs_cache()
 
 
 def test_maybe_compile_can_defer_until_after_kv():
