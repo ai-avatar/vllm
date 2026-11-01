@@ -114,12 +114,13 @@ long-audio `3 * window` dummy. The plugin still windows by
 and the block mask pad to `window` (or the next 256-bucket).
 `mask_mod` reads the valid length from a tensor (not a Python int);
 that tensor is written before each call and before CUDA-graph replay
-(never baked during capture). Cached BlockMasks are a full bucket so
-a short first request cannot empty tail blocks for a later longer
-one. Any encoder call outside `inference_mode` (the timestamp
-aligner) is promoted to inference tensors and uses uncompiled
-FORCE_USE flex. Flex is compiled with `dynamic=False` so those
-remainders cannot recompile. Compile-only skips dummy-audio warmup. Warmup time is
+(never baked during capture). `create_block_mask` keeps the caller's
+seq_lengths; the flex wrapper always pads q/k/v to the bucket and
+builds a matching mask. The timestamp aligner is
+`torch.compiler.disable`'d so it cannot add unique_graphs. A
+profile dummy with `window=max_frames` (e.g. 4000) does not pad a
+500-frame slice to 4000. Flex is compiled with `dynamic=False` so
+those remainders cannot recompile. Compile-only skips dummy-audio warmup. Warmup time is
 logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped
 module (`model.unwrap()` / `.runnable`) because
 `CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.

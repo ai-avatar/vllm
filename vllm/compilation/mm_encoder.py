@@ -80,7 +80,9 @@ _DYNAMO_CONFIGURED = False
 _INDUCTOR_PINNED = False
 _BI_FLEX_COMPILED: Any = None
 _UNWRAPPED_CREATE_BLOCK_MASK: Any = None
+_UNWRAPPED_FLEX: Any = None
 _EAGER_FLEX: Any = None
+_DYNAMO_DISABLED_ATTR = "_vllm_speech_encoder_dynamo_disabled"
 _ALIGNER_ACTIVE = False
 _ENCODER_WRAP_ATTR = "_vllm_speech_encoder_inference_wrapped"
 _LAST_ENCODER_PATH = ""
@@ -342,6 +344,11 @@ def speech_encoder_flex_bucket(
     if frames % win == 0:
         return frames
     if frames <= win:
+        # A profile dummy may set runner.window to max_frames (e.g. 4000)
+        # while the plugin still slices at ~500. Do not pad a short q to
+        # that max. Sliding chunks here are ~500-550, not 4k+.
+        if win >= max(8 * step, 2048):
+            return ((frames + step - 1) // step) * step
         return win
     if frames <= short_cap:
         return ((frames + step - 1) // step) * step
@@ -442,6 +449,37 @@ def _tensor_is_inference(tensor: torch.Tensor) -> bool:
         with contextlib.suppress(Exception):
             return bool(fn())
     return False
+
+
+def _disable_dynamo_fn(fn: Any) -> Any:
+    """Return ``fn`` wrapped so dynamo cannot compile it (recursive)."""
+    if fn is None or getattr(fn, _DYNAMO_DISABLED_ATTR, False):
+        return fn
+    compiler = getattr(torch, "compiler", None)
+    disable = getattr(compiler, "disable", None) if compiler is not None else None
+    if not callable(disable):
+        disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
+    if not callable(disable):
+        return fn
+    try:
+        out = disable(fn, recursive=True)
+    except TypeError:
+        out = disable(fn)
+    with contextlib.suppress(Exception):
+        setattr(out, _DYNAMO_DISABLED_ATTR, True)
+    return out
+
+
+@contextlib.contextmanager
+def _force_eager_compute():
+    """Keep the aligner encoder call out of dynamo (no new unique_graphs)."""
+    compiler = getattr(torch, "compiler", None)
+    set_stance = getattr(compiler, "set_stance", None) if compiler is not None else None
+    if callable(set_stance):
+        with set_stance("force_eager"):
+            yield
+        return
+    yield
 
 
 def _is_cuda_capturing() -> bool:
@@ -739,30 +777,18 @@ def _wrap_create_block_mask(create_mask: Any) -> Any:
         kv_len = _as_pos_int(KV_LEN)
         if q_len is None or kv_len is None or q_len <= 0 or kv_len <= 0:
             return create_mask(mask_mod, B, H, Q_LEN, KV_LEN, *args, **kwargs)
-        bq = speech_encoder_flex_bucket(q_len)
-        bk = speech_encoder_flex_bucket(kv_len)
         device = kwargs.get("device")
-        batch = _as_pos_int(B) or 1
-        heads = _as_pos_int(H)
-        dummy = torch.empty(1, device=device if device is not None else "cpu")
         true_valid = min(q_len, kv_len)
         global _MASK_VALID_LEN
         _MASK_VALID_LEN = true_valid
-        mask = _cached_block_mask(
-            max(bq, bk),
-            true_valid,
-            dummy,
-            batch=batch,
-            heads=heads,
-        )
-        if mask is not None:
-            return mask
+        # Keep the caller's seq_lengths. Bucket masks are created only
+        # after the flex wrapper pads q/k/v to the same size.
         state = _mask_state(device)
         _set_mask_valid_len(state, true_valid, true_valid)
         kwargs = dict(kwargs)
         with contextlib.suppress(TypeError):
             kwargs["separate_full_blocks"] = False
-        return create_mask(state["mask_mod"], B, H, bq, bk, *args, **kwargs)
+        return create_mask(state["mask_mod"], B, H, Q_LEN, KV_LEN, *args, **kwargs)
 
     dynamo = getattr(torch, "_dynamo", None)
     disable = getattr(dynamo, "disable", None) if dynamo is not None else None
@@ -814,13 +840,11 @@ def _call_flex_with_static_bucket(
             k = _pad_flex_qkv(k, bucket)
         if isinstance(v, torch.Tensor):
             v = _pad_flex_qkv(v, bucket)
-    else:
-        if not q.is_contiguous():
-            q = q.contiguous()
-        if isinstance(k, torch.Tensor) and not k.is_contiguous():
-            k = k.contiguous()
-        if isinstance(v, torch.Tensor) and not v.is_contiguous():
-            v = v.contiguous()
+    q = q.contiguous()
+    if isinstance(k, torch.Tensor):
+        k = k.contiguous()
+    if isinstance(v, torch.Tensor):
+        v = v.contiguous()
     new_mask = _cached_block_mask(bucket, valid, q)
     if new_mask is not None:
         kwargs["block_mask"] = new_mask
@@ -828,8 +852,8 @@ def _call_flex_with_static_bucket(
     dtype = q.dtype if isinstance(q, torch.Tensor) and q.is_floating_point() else None
     with _pin_default_dtype(dtype):
         if use_eager:
-            with _aligner_runtime():
-                out = call_fn(*args_list, **kwargs)
+            with _aligner_runtime(), _force_eager_compute():
+                out = _disable_dynamo_fn(call_fn)(*args_list, **kwargs)
         else:
             out = call_fn(*args_list, **kwargs)
     if bucket > orig_t:
@@ -969,17 +993,21 @@ def isolate_flex_attention_from_compile() -> bool:
         fn = getattr(flex_mod, "flex_attention", None)
     wrapped_global = False
     if fn is not None:
-        isolated = _force_flex_attention_kernel(fn)
-        global _EAGER_FLEX
-        _EAGER_FLEX = isolated
-        if isolated is not fn:
-            flex_mod.flex_attention = isolated
+        global _UNWRAPPED_FLEX, _EAGER_FLEX
+        if _UNWRAPPED_FLEX is None:
+            _UNWRAPPED_FLEX = fn
+        source = _UNWRAPPED_FLEX
+        isolated = _force_flex_attention_kernel(source)
+        _EAGER_FLEX = _disable_dynamo_fn(isolated)
+        public = _pad_flex_wrapper(isolated)
+        if public is not fn:
+            flex_mod.flex_attention = public
             for module in list(sys.modules.values()):
                 if module is None:
                     continue
                 try:
                     if getattr(module, "flex_attention", None) is fn:
-                        module.flex_attention = isolated  # type: ignore[attr-defined]
+                        module.flex_attention = public  # type: ignore[attr-defined]
                 except Exception:
                     continue
         wrapped_global = True
@@ -1105,9 +1133,10 @@ def _compile_flex_attention_under_bi(fn: Any) -> Any:
     options = speech_encoder_inductor_config()
     if not options:
         return fn
-    isolated = _force_flex_attention_kernel(fn)
+    source = _UNWRAPPED_FLEX or fn
+    isolated = _force_flex_attention_kernel(source)
     global _EAGER_FLEX
-    _EAGER_FLEX = isolated
+    _EAGER_FLEX = _disable_dynamo_fn(isolated)
     compiled = torch.compile(isolated, dynamic=False, options=options)
     with contextlib.suppress(Exception):
         compiled = functools.update_wrapper(compiled, isolated)
@@ -1130,7 +1159,7 @@ def _replace_nemo_flex_compile_under_bi() -> None:
         import torch.nn.attention.flex_attention as flex_mod
     except ImportError:
         return
-    source = getattr(flex_mod, "flex_attention", None)
+    source = _UNWRAPPED_FLEX or getattr(flex_mod, "flex_attention", None)
     if source is None:
         return
     compiled = _compile_flex_attention_under_bi(source)
@@ -1426,6 +1455,9 @@ def _wrap_speech_encoder_inference(model: Any) -> bool:
     def wrapped(*args: Any, **kwargs: Any):
         with _speech_encoder_runtime():
             args, kwargs = _promote_to_inference(args, kwargs)
+            if _ALIGNER_ACTIVE:
+                with _force_eager_compute():
+                    return _disable_dynamo_fn(orig)(*args, **kwargs)
             return orig(*args, **kwargs)
 
     with contextlib.suppress(Exception):
@@ -1542,8 +1574,8 @@ def configure_speech_encoder_graphs(
         _record_encoder_path("short", processed, processed_len)
         _prime_mask_from_processed(processed, processed_len)
         if return_ctc_timestamp_inputs:
-            with _aligner_runtime():
-                return orig_call_short(
+            with _aligner_runtime(), _force_eager_compute():
+                return _disable_dynamo_fn(orig_call_short)(
                     processed, processed_len, return_ctc_timestamp_inputs
                 )
         frames = processed.shape[2]
@@ -1591,8 +1623,8 @@ def configure_speech_encoder_graphs(
         _prime_mask_from_processed(processed, processed_len)
         assert orig_call_long is not None
         if return_ctc_timestamp_inputs:
-            with _aligner_runtime():
-                return orig_call_long(
+            with _aligner_runtime(), _force_eager_compute():
+                return _disable_dynamo_fn(orig_call_long)(
                     processed, processed_len, return_ctc_timestamp_inputs
                 )
         return orig_call_long(processed, processed_len, return_ctc_timestamp_inputs)
@@ -1769,7 +1801,13 @@ def speech_encoder_warmup_frame_buckets(runner: Any = None) -> list[int]:
 
 
 def _encoder_window(runner: Any) -> int | None:
-    raw = getattr(runner, "window", None) if runner is not None else None
+    if runner is None:
+        return None
+    raw = getattr(runner, "window", None)
+    for name in ("chunk_size", "chunk_length", "window_size", "att_window"):
+        alt = getattr(runner, name, None)
+        if alt and raw and int(raw) > 2 * int(alt):
+            return max(int(alt), 1)
     if raw:
         return max(int(raw), 1)
     return None

@@ -2,28 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compare compiled vs eager Nemotron Transcribe encoder outputs.
 
-Run on a GPU pod with the real checkpoint to reproduce P3d failures
-(aligner AutogradCUDA recompile / dense OOM, stale BlockMask valid
-length, 7.9 s hallucination, 121 s truncation).
+Run on a GPU pod with the real checkpoint to reproduce P3d/P3e failures
+(aligner AutogradCUDA recompile / dense OOM, stale BlockMask, 7.9 s
+hallucination, 121 s truncation, startup 500-frame dummy).
 
 Examples:
-  # Flex-wrapper only (no checkpoint):
   python tools/nemotron_encoder_repro.py --flex-only \\
-      --seconds 7.9,11,121 --frames 99,256,550,1100,1513 --aligner --burst
+      --seconds 7.9,11,121 --frames 99,256,500,550,1100,1513 --aligner --burst
 
-  # Real model (vLLM plugin path):
   VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \\
   python tools/nemotron_encoder_repro.py \\
       --model /path/to/nemotron-3.5-transcribe-bf16 \\
       --seconds 7.9,11,121 --aligner --burst
+
+  # Offline LLM e2e (7.9 s, 121 s, ~25 min; plain + timestamp path):
+  python tools/nemotron_encoder_repro.py --model /path/to/ckpt --e2e
 
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import os
 import sys
+import tempfile
 import traceback
 from typing import Any
 
@@ -58,8 +62,13 @@ def _unique_graphs() -> int:
         return -1
 
 
+def _nullcontext():
+    return contextlib.nullcontext()
+
+
 def _setup_flex(window: int = 550) -> Any:
     os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+    os.environ.setdefault("TORCH_LOGS", "recompiles")
     import vllm.envs as envs
     from vllm.compilation import mm_encoder as mm_encoder_mod
     from vllm.compilation.mm_encoder import (
@@ -80,11 +89,12 @@ def _setup_flex(window: int = 550) -> Any:
 
 def _run_flex_only(args: argparse.Namespace) -> int:
     import torch
-    from torch.nn.attention.flex_attention import flex_attention as raw_flex
+    from torch.nn.attention.flex_attention import flex_attention as imported_flex
 
     from vllm.compilation.mm_encoder import _pad_flex_wrapper
 
     mm_encoder_mod = _setup_flex(args.window)
+    raw_flex = mm_encoder_mod._UNWRAPPED_FLEX or imported_flex
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     hop = args.hop_s
@@ -102,12 +112,12 @@ def _run_flex_only(args: argparse.Namespace) -> int:
         return raw_flex(q, k, v, **kwargs)
 
     compiled = torch.compile(eager_flex, dynamic=False)
-    mm_encoder_mod._EAGER_FLEX = eager_flex
+    mm_encoder_mod._EAGER_FLEX = mm_encoder_mod._disable_dynamo_fn(eager_flex)
     wrapped = _pad_flex_wrapper(compiled)
 
     def one(batch: int, t: int, *, inference: bool):
         q = torch.randn(batch, 16, t, 80, device=device, dtype=dtype)
-        ctx = torch.inference_mode() if inference else torch.nullcontext()
+        ctx = torch.inference_mode() if inference else _nullcontext()
         with ctx:
             mm_encoder_mod._begin_encoder_mask(t)
             return wrapped(q, q, q)
@@ -157,7 +167,6 @@ def _run_flex_only(args: argparse.Namespace) -> int:
                 q,
                 kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
             )
-        # Eager raw_flex is unpadded; compare the valid prefix.
         t_cmp = min(compiled_out.shape[-2], eager_out.shape[-2], t)
         rel = _rel_err(compiled_out[..., :t_cmp, :], eager_out[..., :t_cmp, :])
         mad = _max_abs(compiled_out[..., :t_cmp, :], eager_out[..., :t_cmp, :])
@@ -175,7 +184,7 @@ def _run_flex_only(args: argparse.Namespace) -> int:
                 q = torch.randn(1, 16, t, 80, device=device, dtype=dtype)
                 mm_encoder_mod._begin_encoder_mask(t)
                 probes[t] = (q, wrapped(q, q, q))
-            for t in (1, 50, 99, 129, 400, 549, 551, 1513, 1906):
+            for t in (1, 50, 99, 129, 400, 500, 549, 551, 1513, 1906):
                 other = torch.randn(1, 16, t, 80, device=device, dtype=dtype)
                 mm_encoder_mod._begin_encoder_mask(t)
                 wrapped(other, other, other)
@@ -191,7 +200,7 @@ def _run_flex_only(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-def _load_vllm_encoder(model: str, compile_mm: bool):
+def _load_vllm_encoder(model: str, compile_mm: bool, gpu_memory_utilization: float):
     from vllm import LLM
     from vllm.compilation.mm_encoder import (
         isolate_flex_attention_from_compile,
@@ -200,10 +209,12 @@ def _load_vllm_encoder(model: str, compile_mm: bool):
 
     os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+    os.environ.setdefault("TORCH_LOGS", "recompiles")
     isolate_flex_attention_from_compile()
     llm = LLM(
         model=model,
         dtype="bfloat16",
+        gpu_memory_utilization=gpu_memory_utilization,
         compilation_config={
             "compile_mm_encoder": compile_mm,
             "cudagraph_mm_encoder": compile_mm,
@@ -243,6 +254,106 @@ def _encoder_forward(inner, processed, processed_len):
     return encoder(processed, processed_len)
 
 
+def _tensor_to_cpu(obj):
+    import torch
+
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().contiguous().cpu()
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_tensor_to_cpu(x) for x in obj)
+    return obj
+
+
+def _tensor_to_payload(tensor) -> dict[str, object]:
+    import pybase64 as base64
+    import torch
+
+    cpu = tensor.detach().contiguous().cpu().clone()
+    data = cpu.view(torch.uint8).reshape(-1).numpy().tobytes()
+    return {
+        "shape": list(cpu.shape),
+        "dtype": str(cpu.dtype),
+        "data": base64.b64encode(data).decode("ascii"),
+    }
+
+
+def _first_tensor(obj):
+    import torch
+
+    obj = _tensor_to_cpu(obj)
+    if isinstance(obj, torch.Tensor):
+        return obj
+    if isinstance(obj, (list, tuple)) and obj:
+        return _first_tensor(obj[0])
+    raise TypeError(f"no tensor in {type(obj)}")
+
+
+def _payload_to_tensor(payload: dict[str, object]):
+    import pybase64 as base64
+    import torch
+
+    shape = payload["shape"]
+    dtype_s = str(payload["dtype"]).removeprefix("torch.")
+    raw = base64.b64decode(str(payload["data"]))
+    dtype = getattr(torch, dtype_s)
+    storage = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+    return storage.view(dtype).reshape(shape).clone()
+
+
+def _eager_encode_worker(model: str, frames: list[int], n_feat: int, out_path: str):
+    import torch
+
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+
+    llm, inner = _load_vllm_encoder(
+        model, compile_mm=False, gpu_memory_utilization=0.35
+    )
+    if inner is None:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump({"ok": False, "error": "no inner model"}, fh)
+        return
+    device = next(inner.parameters()).device
+    dtype = next(p.dtype for p in inner.parameters() if p.is_floating_point())
+    outs = {}
+    for t in frames:
+        torch.manual_seed(t)
+        processed = torch.randn(1, n_feat, t, device=device, dtype=dtype)
+        processed_len = torch.tensor([t], device=device, dtype=torch.int64)
+        mm_encoder_mod._begin_encoder_mask(t)
+        with torch.inference_mode():
+            outs[str(t)] = _tensor_to_payload(
+                _first_tensor(_encoder_forward(inner, processed, processed_len))
+            )
+    del llm
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump({"ok": True, "outs": outs}, fh)
+
+
+def _run_eager_subprocess(model: str, frames: list[int], n_feat: int) -> dict:
+    import subprocess
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        out_path = tmp.name
+    cmd = [
+        sys.executable,
+        "-c",
+        (
+            "from tools.nemotron_encoder_repro import _eager_encode_worker; "
+            f"_eager_encode_worker({model!r}, {frames!r}, {n_feat}, {out_path!r})"
+        ),
+    ]
+    env = os.environ.copy()
+    env.setdefault("VLLM_BATCH_INVARIANT", "1")
+    env.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+    env.setdefault("TORCH_LOGS", "recompiles")
+    print(f"eager subprocess: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, check=False, env=env)
+    if proc.returncode != 0:
+        return {"ok": False, "error": f"eager worker exit {proc.returncode}"}
+    with open(out_path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 def _run_model(args: argparse.Namespace) -> int:
     import torch
 
@@ -255,7 +366,9 @@ def _run_model(args: argparse.Namespace) -> int:
         frames.append(_seconds_to_frames(sec, hop))
     frames = sorted(set(int(f) for f in frames if f > 0))
     print(f"loading compiled encoder from {args.model}")
-    compiled_llm, compiled_inner = _load_vllm_encoder(args.model, compile_mm=True)
+    compiled_llm, compiled_inner = _load_vllm_encoder(
+        args.model, compile_mm=True, gpu_memory_utilization=args.gpu_memory_utilization
+    )
     if compiled_inner is None:
         print("WARN: could not unwrap compiled model; flex-only fallback")
         return _run_flex_only(args)
@@ -267,14 +380,14 @@ def _run_model(args: argparse.Namespace) -> int:
         processed = torch.randn(batch, n_feat, t, device=device, dtype=dtype)
         processed_len = torch.tensor([t], device=device, dtype=torch.int64)
         mm_encoder_mod._begin_encoder_mask(t)
-        ctx = torch.inference_mode() if inference else torch.nullcontext()
+        ctx = torch.inference_mode() if inference else _nullcontext()
         with ctx:
             return _encoder_forward(inner, processed, processed_len)
 
     print("warmup + compiled encodings")
     torch._dynamo.reset()
     with torch.inference_mode():
-        for t in (256, args.window, 2 * args.window):
+        for t in (256, args.window, 2 * args.window, 500):
             try:
                 encode(compiled_inner, t, inference=True)
             except Exception as exc:
@@ -322,30 +435,21 @@ def _run_model(args: argparse.Namespace) -> int:
             )
         mm_encoder_mod._set_serving_watch(False)
 
-    print("loading eager (compile off) encoder")
+    print("loading eager encoder in a subprocess (do not load two engines here)")
     del compiled_llm
     if device.type == "cuda":
         torch.accelerator.empty_cache()
-    eager_llm, eager_inner = _load_vllm_encoder(args.model, compile_mm=False)
-    if eager_inner is None:
-        print("WARN: could not unwrap eager model")
+    eager = _run_eager_subprocess(args.model, frames, n_feat)
+    if not eager.get("ok"):
+        print(f"WARN: eager subprocess failed: {eager.get('error')}")
         return 1 if failed else 0
-    print("compiled vs eager")
+    print("compiled vs eager (subprocess)")
     for t in frames:
         if t not in compiled_out:
             continue
         try:
-            torch.manual_seed(t)
-            eager_out = encode(eager_inner, t, inference=True)
-            left = compiled_out[t]
-            if isinstance(left, tuple):
-                left = left[0]
-            if isinstance(eager_out, tuple):
-                eager_out = eager_out[0]
-            if isinstance(left, list):
-                left = left[0]
-            if isinstance(eager_out, list):
-                eager_out = eager_out[0]
+            left = _first_tensor(compiled_out[t])
+            eager_out = _payload_to_tensor(eager["outs"][str(t)])
             rel = _rel_err(left, eager_out)
             mad = _max_abs(left, eager_out)
             ok = rel < 0.08
@@ -357,15 +461,104 @@ def _run_model(args: argparse.Namespace) -> int:
             print(f"  T={t} compare FAIL: {exc}")
             traceback.print_exc()
 
-    if args.burst and compiled_inner is not None:
-        print("burst skipped after eager reload (run --flex-only --burst)")
-
-    del eager_llm
     print(f"model repro done failed={failed}")
     return 1 if failed else 0
 
 
+def _synth_wav(seconds: float, sr: int = 16000):
+    import torch
+
+    n = max(int(seconds * sr), 1)
+    t = torch.arange(n, dtype=torch.float32) / float(sr)
+    wave = (0.08 * torch.sin(2 * 3.14159265 * 180.0 * t)).numpy()
+    return wave, sr
+
+
+def _print_output_text(outputs) -> str:
+    if not outputs:
+        return ""
+    first = outputs[0]
+    out = getattr(first, "outputs", None)
+    if out:
+        return str(out[0].text)
+    return str(first)
+
+
+def _run_e2e(args: argparse.Namespace) -> int:
+    """Offline LLM.generate for 7.9 s / 121 s / ~25 min, plain + timestamps."""
+    from vllm import LLM
+    from vllm.sampling_params import SamplingParams
+
+    os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+    os.environ.setdefault("TORCH_LOGS", "recompiles")
+    seconds = args.e2e_seconds or [7.9, 121.0, 1500.0]
+    print(f"e2e LLM load {args.model} seconds={seconds}")
+    llm = LLM(
+        model=args.model,
+        dtype="bfloat16",
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        compilation_config={
+            "compile_mm_encoder": True,
+            "cudagraph_mm_encoder": True,
+        },
+        enable_prefix_caching=False,
+    )
+    after_load = _unique_graphs()
+    print(f"unique_graphs after load={after_load}")
+    failed = 0
+    for sec in seconds:
+        wave, sr = _synth_wav(sec)
+        prompt = {"prompt": "", "multi_modal_data": {"audio": (wave, sr)}}
+        print(f"--- plain {sec}s ({len(wave)} samples @ {sr}) ---")
+        try:
+            before = _unique_graphs()
+            outs = llm.generate(
+                prompt,
+                SamplingParams(temperature=0.0, max_tokens=args.e2e_max_tokens),
+            )
+            text = _print_output_text(outs)
+            after = _unique_graphs()
+            print(f"  graphs {before} -> {after}")
+            print(f"  text[:240]={text[:240]!r}")
+            if after_load >= 0 and after > after_load and before == after_load:
+                print("  WARN: new graphs on this request")
+        except Exception as exc:
+            failed += 1
+            print(f"  plain FAIL: {exc}")
+            traceback.print_exc()
+        print(f"--- timestamps/verbose {sec}s ---")
+        try:
+            before = _unique_graphs()
+            outs = llm.generate(
+                prompt,
+                SamplingParams(
+                    temperature=0.0,
+                    max_tokens=args.e2e_max_tokens,
+                    extra_args={"return_ctc_timestamp_inputs": True},
+                ),
+                mm_processor_kwargs={
+                    "return_timestamps": True,
+                    "timestamp_granularities": ["word"],
+                },
+            )
+            text = _print_output_text(outs)
+            after = _unique_graphs()
+            print(f"  graphs {before} -> {after}")
+            print(f"  text[:240]={text[:240]!r}")
+            if after != before and before >= 0:
+                failed += 1
+                print("  FAIL: timestamp path created new dynamo graphs")
+        except Exception as exc:
+            failed += 1
+            print(f"  timestamps FAIL: {exc}")
+            traceback.print_exc()
+    print(f"e2e done failed={failed} unique_graphs={_unique_graphs()}")
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    os.environ.setdefault("TORCH_LOGS", "recompiles")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="", help="Nemotron Transcribe checkpoint")
     parser.add_argument(
@@ -374,18 +567,30 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip model load; exercise the patched flex wrapper only",
     )
     parser.add_argument(
+        "--e2e",
+        action="store_true",
+        help="Offline LLM.generate for 7.9s / 121s / ~25min, plain + timestamps",
+    )
+    parser.add_argument(
+        "--e2e-seconds",
+        default="7.9,121,1500",
+        help="Durations for --e2e (1500 s ≈ 25 min)",
+    )
+    parser.add_argument("--e2e-max-tokens", type=int, default=4096)
+    parser.add_argument(
         "--seconds",
         default="7.9,11,121",
         help="Comma-separated durations (converted at --hop-s)",
     )
     parser.add_argument(
         "--frames",
-        default="99,256,550,1100,1513",
+        default="99,256,500,550,1100,1513",
         help="Comma-separated encoder frame lengths",
     )
     parser.add_argument("--hop-s", type=float, default=0.08, help="Seconds per frame")
     parser.add_argument("--window", type=int, default=550)
     parser.add_argument("--n-feat", type=int, default=128)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument(
         "--aligner",
         action="store_true",
@@ -399,6 +604,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     args.seconds = _parse_floats(args.seconds)
     args.frames = _parse_ints(args.frames)
+    args.e2e_seconds = _parse_floats(args.e2e_seconds)
+    if args.e2e:
+        if not args.model:
+            print("--e2e requires --model")
+            return 2
+        return _run_e2e(args)
     if args.flex_only or not args.model:
         if not args.model and not args.flex_only:
             print("no --model; using --flex-only")

@@ -839,6 +839,18 @@ def test_flex_bucket_maps_remainders_onto_closed_set(frames: int, expected: int)
     )
 
 
+def test_flex_bucket_does_not_expand_short_q_to_max_frames():
+    """Profile dummy window=4000 must not pad T=500 to 4000."""
+    assert (
+        speech_encoder_flex_bucket(500, window=4000, max_windows=2, bucket_step=256)
+        == 512
+    )
+    assert (
+        speech_encoder_flex_bucket(500, window=550, max_windows=2, bucket_step=256)
+        == 550
+    )
+
+
 def test_flex_wrapper_pads_qkv_and_crops_to_valid():
     mm_encoder_mod.set_speech_encoder_shape_config(
         window=550, max_windows=2, bucket_step=256
@@ -921,8 +933,24 @@ def test_create_block_mask_uses_flex_bucket():
         return (q_idx < 400) & (kv_idx < 400)
 
     mask = create_block_mask(mod, 1, 1, 400, 400, device="cpu")
-    assert tuple(int(s) for s in mask.seq_lengths) == (550, 550)
+    assert tuple(int(s) for s in mask.seq_lengths) == (400, 400)
     assert speech_encoder_mask_mod_closes_over_tensors(mask.mask_mod)
+
+
+def test_create_block_mask_keeps_caller_length_not_cached_bucket():
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    isolate_flex_attention_from_compile()
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    def mod(_b, _h, q_idx, kv_idx):
+        return (q_idx < 99) & (kv_idx < 99)
+
+    mask99 = create_block_mask(mod, 1, 1, 99, 99, device="cpu")
+    mask550 = create_block_mask(mod, 1, 1, 550, 550, device="cpu")
+    assert tuple(int(s) for s in mask99.seq_lengths) == (99, 99)
+    assert tuple(int(s) for s in mask550.seq_lengths) == (550, 550)
 
 
 def test_mask_mod_valid_length_is_tensor_not_int():

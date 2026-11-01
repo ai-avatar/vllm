@@ -103,10 +103,17 @@ def _padding_block_mask(create_block_mask, frames: int, valid: int, device):
 def _true_eager_windows(block: _NeMoStyleFlexBlock, x: torch.Tensor) -> torch.Tensor:
     """Reference encode with raw flex / create_block_mask (no vLLM wrapper)."""
     from torch.nn.attention.flex_attention import (
-        create_block_mask as raw_create,
+        create_block_mask as imported_create,
     )
     from torch.nn.attention.flex_attention import (
-        flex_attention as raw_flex,
+        flex_attention as imported_flex,
+    )
+
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+
+    raw_create = mm_encoder_mod._UNWRAPPED_CREATE_BLOCK_MASK or imported_create
+    raw_flex = (
+        mm_encoder_mod._UNWRAPPED_FLEX or mm_encoder_mod._EAGER_FLEX or imported_flex
     )
 
     valid = x.shape[1]
