@@ -100,11 +100,19 @@ the SpeechLM hf config. vLLM compiles `perception.encoder` blocks itself
 (the plugin `encoder_compile` flag is an input only) after forcing
 `FORCE_USE_FLEX_ATTENTION` on NeMo's `_flex_attention_compiled` /
 `_get_flex_attention` so inductor cannot pick flex-decoding for inputs
-shorter than 128 encoder frames (10.24 s). Layer compile and graph
-capture are deferred until after KV allocation; capture is lazy per
-`(batch, bucket)`. Under `VLLM_BATCH_INVARIANT=1` the default batch
-grid is `(1,)` and the replay path is a function of each item's valid
-length.
+shorter than 128 encoder frames (10.24 s). The leftover
+`_use_flex_decoding` `Q < 128` guard is short-circuited so crossing
+128 frames does not recompile. Layer compile and graph capture are
+deferred until after KV allocation; a post-KV warmup then compiles
+and captures every `(batch, frame-bucket)` (under BI: batch 1 ×
+buckets up to the audio cap) with dummy audio so the first real
+request has no spike. Warmup time is logged and is not counted as
+peak activation. Pending-compile state is stored on the unwrapped
+module (`model.unwrap()` / `.runnable`) because
+`CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.
+Capture of a missing bucket after warmup is still lazy. Under
+`VLLM_BATCH_INVARIANT=1` the default batch grid is `(1,)` and the
+replay path is a function of each item's valid length.
 
 ```bash
 VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \

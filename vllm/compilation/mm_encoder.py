@@ -22,7 +22,10 @@ Speech encoder CUDA graphs are captured lazily after KV allocation, with
 batch sizes ``(1,)`` under ``VLLM_BATCH_INVARIANT``. The replay path is a
 function of each item's valid length, not the padded tensor width.
 Layer compile is also deferred until after KV so inductor workspaces are
-not counted as peak activation.
+not counted as peak activation. A post-KV warmup then compiles and
+captures every (batch, frame-bucket) so the first real request has no
+spike. Pending-compile state is stored on the unwrapped module:
+``CUDAGraphWrapper.__getattr__`` forwards, but ``delattr`` does not.
 """
 
 from __future__ import annotations
@@ -30,6 +33,8 @@ from __future__ import annotations
 import contextlib
 import functools
 import sys
+import time
+import weakref
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -48,6 +53,11 @@ _FLEX_ISOLATED_ATTR = "_vllm_speech_encoder_flex_isolated"
 _RUNNER_PATCH_ATTR = "_vllm_speech_graph_patched"
 _PENDING_LAYERS_ATTR = "_vllm_speech_encoder_pending_compile"
 _DYNAMO_CONFIGURED = False
+# getattr on CUDAGraphWrapper forwards to .runnable; delattr does not.
+# Keep a side table so pending layers survive wrap/unwrap either way.
+_PENDING_LAYERS: weakref.WeakKeyDictionary[Any, list[nn.Module]] = (
+    weakref.WeakKeyDictionary()
+)
 
 _NEMOTRON_SPEECH_ARCH_MARKERS = ("NeMoSpeechLM",)
 _NEMOTRON_SPEECH_MODEL_TYPES = ("nemo_speechlm",)
@@ -58,6 +68,15 @@ _NEMOTRON_SPEECH_MODEL_TYPES = ("nemo_speechlm",)
 _SPEECH_ENCODER_RECOMPILE_LIMIT = 64
 # A100 80GB + ~63GB weights: a 16-row grid left ~1.1 GiB for KV.
 _MAX_ENCODER_GRAPH_BATCH = 8
+# 80 ms / encoder frame; 16 kHz waveform; 256-frame graph buckets.
+_ENCODER_FRAME_HOP_S = 0.08
+_DEFAULT_SAMPLE_RATE = 16000
+_DEFAULT_FRAME_BUCKET = 256
+_DEFAULT_N_FEAT = 80
+_DEFAULT_MAX_WINDOWS = 2
+# Compile-specialize long audio without encoding every 256-frame step
+# up to a 3600 s cap (that would be ~176 full forwards).
+_WARMUP_LONG_DURATIONS_S = (30, 60, 120, 180, 240, 300, 600)
 
 
 def is_nemo_speechlm_config(hf_config: object | None) -> bool:
@@ -97,6 +116,61 @@ def default_speech_encoder_graph_batch_sizes(
         sizes.append(n)
         n *= 2
     return tuple(sizes)
+
+
+def unwrap_speech_encoder_model(model: Any) -> Any:
+    """Walk ``unwrap()`` / ``.runnable`` to the inner module.
+
+    ``CUDAGraphWrapper.__getattr__`` forwards to the runnable, but
+    ``delattr`` does not. Pending-compile state must live on the
+    unwrapped module (or in ``_PENDING_LAYERS``).
+    """
+    current = model
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        unwrap = getattr(current, "unwrap", None)
+        if callable(unwrap):
+            try:
+                inner = unwrap()
+            except Exception:
+                inner = None
+            if inner is not None and inner is not current:
+                current = inner
+                continue
+        runnable = getattr(current, "runnable", None)
+        if runnable is not None and runnable is not current:
+            current = runnable
+            continue
+        break
+    return current
+
+
+def _store_pending_layers(model: Any, layers: list[nn.Module]) -> None:
+    owner = unwrap_speech_encoder_model(model)
+    with contextlib.suppress(Exception):
+        setattr(owner, _PENDING_LAYERS_ATTR, layers)
+    with contextlib.suppress(TypeError):
+        _PENDING_LAYERS[owner] = layers
+
+
+def _pop_pending_layers(model: Any) -> list[nn.Module] | None:
+    owner = unwrap_speech_encoder_model(model)
+    layers = getattr(owner, _PENDING_LAYERS_ATTR, None)
+    if layers is None:
+        layers = getattr(model, _PENDING_LAYERS_ATTR, None)
+    if layers is None:
+        with contextlib.suppress(TypeError, KeyError):
+            layers = _PENDING_LAYERS.pop(owner, None)
+    if layers is None:
+        with contextlib.suppress(TypeError, KeyError):
+            layers = _PENDING_LAYERS.pop(model, None)
+    for obj in (owner, model):
+        with contextlib.suppress(AttributeError):
+            delattr(obj, _PENDING_LAYERS_ATTR)
+        with contextlib.suppress(TypeError, KeyError):
+            _PENDING_LAYERS.pop(obj, None)
+    return layers
 
 
 def sync_mm_encoder_compile_flags(vllm_config: VllmConfig) -> None:
@@ -196,6 +270,44 @@ def _patch_get_flex_attention(getter: Any) -> Any:
     return wrapped
 
 
+def _patch_flex_decoding_guard() -> None:
+    """Skip inductor's ``Q < 128`` guard when the main kernel is forced.
+
+    ``_use_flex_decoding`` evaluates ``guard_or_false(Q < 128)`` *before*
+    checking ``FORCE_USE_FLEX_ATTENTION``, so the 128-frame guard is
+    still installed and dynamo recompiles around that boundary.
+    """
+    try:
+        from torch._inductor.kernel.flex import flex_decoding as flex_dec
+    except ImportError:
+        return
+    orig = getattr(flex_dec, "_use_flex_decoding", None)
+    if orig is None or getattr(orig, _FLEX_ISOLATED_ATTR, False):
+        return
+
+    def wrapped(
+        query: Any,
+        kv_indices: Any,
+        value: Any,
+        kernel_options: Any,
+        enable_gqa: bool = False,
+    ) -> bool:
+        opts = kernel_options or {}
+        if opts.get("FORCE_USE_FLEX_ATTENTION") or opts.get("BACKEND") == "TRITON":
+            return False
+        return orig(query, kv_indices, value, opts, enable_gqa)
+
+    with contextlib.suppress(Exception):
+        wrapped = functools.update_wrapper(wrapped, orig)
+    setattr(wrapped, _FLEX_ISOLATED_ATTR, True)
+    flex_dec._use_flex_decoding = wrapped
+    with contextlib.suppress(Exception):
+        from torch._inductor.kernel.flex import flex_attention as flex_attn
+
+        if getattr(flex_attn, "_use_flex_decoding", None) is orig:
+            flex_attn._use_flex_decoding = wrapped
+
+
 def isolate_flex_attention_from_compile() -> bool:
     """Force the non-decoding flex kernel on NeMo's compiled wrapper.
 
@@ -204,7 +316,8 @@ def isolate_flex_attention_from_compile() -> bool:
     flex_attention, dynamic=True)``. Graph-breaking that wrapper is
     correct (short-clip WER ~3.1%) but ~6× slower. Injecting
     ``FORCE_USE_FLEX_ATTENTION`` keeps flex inside the inductor graph on
-    the main kernel.
+    the main kernel. Inductor's ``_use_flex_decoding`` 128-frame guard
+    is short-circuited so crossing 128 frames does not recompile.
 
     Always re-scans loaded modules so a late NeMo import is still
     patched.
@@ -213,6 +326,7 @@ def isolate_flex_attention_from_compile() -> bool:
         True when the global op was wrapped, or already wrapped.
 
     """
+    _patch_flex_decoding_guard()
     try:
         import torch.nn.attention.flex_attention as flex_mod
     except ImportError:
@@ -636,21 +750,258 @@ def compile_pending_speech_encoder_layers(model: nn.Module | None) -> int:
     if model is None:
         return 0
     isolate_flex_attention_from_compile()
-    layers = getattr(model, _PENDING_LAYERS_ATTR, None)
+    layers = _pop_pending_layers(model)
     if not layers:
         return 0
-    delattr(model, _PENDING_LAYERS_ATTR)
-    compiled = _compile_speech_encoder_layers(model, layers)
+    compiled = _compile_speech_encoder_layers(
+        unwrap_speech_encoder_model(model), layers
+    )
     if compiled:
         with contextlib.suppress(Exception):
             torch.accelerator.empty_cache()
     return compiled
 
 
+def _audio_cap_frames() -> int:
+    duration_s = int(getattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 600) or 600)
+    return max(1, int(duration_s / _ENCODER_FRAME_HOP_S))
+
+
+def _audio_cap_s() -> float:
+    return float(getattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 600) or 600)
+
+
+def _frame_bucket_step(runner: Any) -> int:
+    bucket_fn = getattr(runner, "_frame_bucket", None)
+    if callable(bucket_fn):
+        with contextlib.suppress(Exception):
+            step = int(bucket_fn(1))
+            if step > 0:
+                return step
+    raw = getattr(runner, "frame_bucket", None)
+    if raw:
+        return max(int(raw), 1)
+    return _DEFAULT_FRAME_BUCKET
+
+
+def _whole_forward_max_frames(runner: Any) -> int | None:
+    if runner is None:
+        return None
+    for name in ("max_frames", "max_seq_len"):
+        raw = getattr(runner, name, None)
+        if raw:
+            return int(raw)
+    window = getattr(runner, "window", None)
+    if not window:
+        return None
+    windows = getattr(runner, "max_windows", None) or _DEFAULT_MAX_WINDOWS
+    return int(window) * int(windows)
+
+
+def speech_encoder_warmup_frame_buckets(runner: Any = None) -> list[int]:
+    """256-frame buckets covering whole-forward graphs up to the audio cap."""
+    step = _frame_bucket_step(runner)
+    cap = _audio_cap_frames()
+    limit = cap
+    max_fwd = _whole_forward_max_frames(runner)
+    if max_fwd is not None:
+        limit = min(limit, max_fwd)
+    buckets: list[int] = []
+    n = step
+    while n < limit:
+        buckets.append(n)
+        n += step
+    last = ((max(limit, 1) + step - 1) // step) * step
+    if last not in buckets:
+        buckets.append(last)
+    return buckets
+
+
+def _warmup_encode_durations_s(runner: Any = None) -> list[float]:
+    cap = _audio_cap_s()
+    durations = [3.2, 6.4, 10.24]
+    durations.extend(
+        bucket * _ENCODER_FRAME_HOP_S
+        for bucket in speech_encoder_warmup_frame_buckets(runner)
+    )
+    durations.extend(d for d in _WARMUP_LONG_DURATIONS_S if d <= cap)
+    if cap not in durations:
+        durations.append(cap)
+    seen: set[int] = set()
+    out: list[float] = []
+    for duration in durations:
+        if duration <= 0 or duration > cap:
+            continue
+        key = int(round(duration * 1000))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(float(duration))
+    return out
+
+
+def _model_device(model: Any) -> torch.device:
+    inner = unwrap_speech_encoder_model(model)
+    if isinstance(inner, nn.Module):
+        for param in inner.parameters():
+            return param.device
+    return torch.device("cpu")
+
+
+def _dummy_waveform(
+    rows: int, duration_s: float, device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    samples = max(int(round(duration_s * _DEFAULT_SAMPLE_RATE)), 1)
+    audio = torch.zeros(rows, samples, device=device, dtype=dtype)
+    lengths = torch.full((rows,), samples, device=device, dtype=torch.int64)
+    return audio, lengths
+
+
+def _call_speech_encode(model: Any, audio: torch.Tensor, lengths: torch.Tensor) -> bool:
+    inner = unwrap_speech_encoder_model(model)
+    perception = getattr(inner, "perception", None)
+    if isinstance(perception, nn.Module):
+        forward = getattr(type(perception), "forward", None)
+        if forward is not None and forward is not nn.Module.forward:
+            perception(audio, lengths)
+            return True
+    for name in ("encode_audio", "process_audio", "_process_audio", "encode"):
+        fn = getattr(inner, name, None)
+        if callable(fn):
+            fn(audio, lengths)
+            return True
+    return False
+
+
+def _warmup_graphs(runner: Any, model: Any) -> int:
+    if runner is None or not getattr(runner, _RUNNER_PATCH_ATTR, False):
+        return 0
+    if not getattr(runner, "_vllm_allow_capture", False):
+        return 0
+    if getattr(runner, "pool", None) is None:
+        with contextlib.suppress(Exception):
+            runner.pool = torch.cuda.graph_pool_handle()
+    inner = unwrap_speech_encoder_model(model)
+    dtype = _module_floating_dtype(inner if isinstance(inner, nn.Module) else model)
+    if dtype is None:
+        dtype = torch.float32
+    n_feat = int(
+        getattr(runner, "n_feat", None)
+        or getattr(runner, "feat_in", None)
+        or _DEFAULT_N_FEAT
+    )
+    batches = [
+        int(b)
+        for b in (
+            getattr(runner, "batch_sizes", None)
+            or default_speech_encoder_graph_batch_sizes()
+        )
+    ]
+    captured = 0
+    for rows in batches:
+        for frames in speech_encoder_warmup_frame_buckets(runner):
+            if (rows, frames) in getattr(runner, "graphs", {}):
+                continue
+            try:
+                _capture_one_graph(runner, rows, frames, n_feat, dtype)
+                captured += 1
+            except Exception as exc:
+                logger.warning(
+                    "Speech encoder warmup capture failed for %d rows x %d frames: %s",
+                    rows,
+                    frames,
+                    exc,
+                )
+    return captured
+
+
+def _warmup_encode(model: Any, runner: Any) -> int:
+    inner = unwrap_speech_encoder_model(model)
+    device = _model_device(inner)
+    dtype = _module_floating_dtype(inner if isinstance(inner, nn.Module) else model)
+    if dtype is None:
+        dtype = torch.float32
+    warmed = 0
+    batches = default_speech_encoder_graph_batch_sizes()
+    if runner is not None and getattr(runner, "batch_sizes", None):
+        batches = tuple(int(b) for b in runner.batch_sizes)
+    for duration_s in _warmup_encode_durations_s(runner):
+        for rows in batches:
+            audio, lengths = _dummy_waveform(rows, duration_s, device, dtype)
+            try:
+                if not _call_speech_encode(inner, audio, lengths):
+                    return warmed
+                warmed += 1
+            except Exception as exc:
+                logger.warning(
+                    "Speech encoder warmup encode failed for %d x %.1fs: %s",
+                    rows,
+                    duration_s,
+                    exc,
+                )
+                if warmed == 0:
+                    return 0
+    return warmed
+
+
+def warmup_speech_encoder(model: nn.Module | None) -> float:
+    """Compile and capture every warmup bucket after KV allocation.
+
+    Under ``VLLM_BATCH_INVARIANT`` the grid is batch 1 × frame buckets
+    up to the audio cap (whole-forward graphs) plus a few long-audio
+    dummy encodes. Logs elapsed seconds. Must not run during memory
+    profiling.
+
+    Returns:
+        Warmup time in seconds (0 when there is nothing to warm).
+
+    """
+    if model is None:
+        return 0.0
+    inner = unwrap_speech_encoder_model(model)
+    runner = getattr(inner, "_encoder_graphs", None)
+    want_graphs = (
+        runner is not None
+        and getattr(runner, _RUNNER_PATCH_ATTR, False)
+        and getattr(runner, "_vllm_allow_capture", False)
+    )
+    want_compile = False
+    if isinstance(inner, nn.Module):
+        want_compile = any(
+            getattr(layer, _COMPILED_ATTR, False)
+            for layer in collect_speech_encoder_layers(inner)
+        )
+    if not want_graphs and not want_compile:
+        return 0.0
+
+    started = time.perf_counter()
+    captured = 0
+    encoded = 0
+    with torch.inference_mode():
+        if want_graphs:
+            captured = _warmup_graphs(runner, inner)
+        if want_compile:
+            encoded = _warmup_encode(inner, runner)
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "Speech encoder warmup finished in %.2f s "
+        "(captured %d graph(s), encoded %d dummy clip(s)).",
+        elapsed,
+        captured,
+        encoded,
+    )
+    return elapsed
+
+
 def enable_speech_encoder_after_kv(model: nn.Module | None) -> None:
-    """Compile deferred layers and allow lazy graph capture after KV."""
+    """Compile deferred layers, enable capture, and warm all buckets.
+
+    Runs after KV allocation so inductor workspaces and graph capture
+    are not counted as peak activation.
+    """
     compile_pending_speech_encoder_layers(model)
     enable_speech_encoder_graph_capture(model)
+    warmup_speech_encoder(model)
 
 
 def maybe_compile_speech_mm_encoder(
@@ -678,15 +1029,20 @@ def maybe_compile_speech_mm_encoder(
     if not want_compile:
         return 0
 
-    layers = collect_speech_encoder_layers(model)
+    inner = unwrap_speech_encoder_model(model)
+    layers = collect_speech_encoder_layers(
+        inner if isinstance(inner, nn.Module) else model
+    )
     if not layers:
         return 0
     if defer:
-        setattr(model, _PENDING_LAYERS_ATTR, layers)
+        _store_pending_layers(model, layers)
         logger.info(
             "Deferring compile of %d speech-encoder layer(s) until after "
             "KV allocation.",
             len(layers),
         )
         return 0
-    return _compile_speech_encoder_layers(model, layers)
+    return _compile_speech_encoder_layers(
+        inner if isinstance(inner, nn.Module) else model, layers
+    )

@@ -528,7 +528,8 @@ class CompilationConfig:
     Nemotron Transcribe compiles ``perception.encoder`` blocks after load
     with dynamic shapes. Flex stays in the graph with
     ``FORCE_USE_FLEX_ATTENTION`` so inductor cannot pick flex-decoding
-    for short audio. Compile is deferred until after KV allocation.
+    for short audio. Compile is deferred until after KV allocation,
+    then a dummy-audio warmup compiles every frame bucket.
     vLLM owns that compile; the plugin hf-override ``encoder_compile``
     is an input only.
     """
@@ -542,9 +543,11 @@ class CompilationConfig:
     For NeMo SpeechLM this is equivalent to ``VLLM_CUDAGRAPH_MM_ENCODER=1``
     and hf ``encoder_cuda_graphs``; any of the three enables the plugin's
     ``EncoderGraphRunner``. The effective value is written back to both
-    configs.     Capture and layer compile are deferred until after KV allocation.
-    Capture is lazy per (batch, bucket). Under ``VLLM_BATCH_INVARIANT``
-    the default batch grid is ``(1,)``. vLLM's vision
+    configs. Capture and layer compile are deferred until after KV
+    allocation, then a post-KV warmup captures every (batch, bucket).
+    Capture of a later missing bucket is still lazy. Under
+    ``VLLM_BATCH_INVARIANT`` the default batch grid is ``(1,)``. vLLM's
+    vision
     ``EncoderCudaGraphManager`` is used only when the model implements
     ``SupportsEncoderCudaGraph``.
     """

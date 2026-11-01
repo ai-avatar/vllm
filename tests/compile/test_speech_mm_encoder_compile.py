@@ -11,6 +11,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation import mm_encoder as mm_encoder_mod
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.mm_encoder import (
     collect_speech_encoder_layers,
     compile_pending_speech_encoder_layers,
@@ -23,8 +24,12 @@ from vllm.compilation.mm_encoder import (
     isolate_flex_attention_from_compile,
     maybe_compile_speech_mm_encoder,
     speech_encoder_layer_compile_kwargs,
+    speech_encoder_warmup_frame_buckets,
     sync_mm_encoder_compile_flags,
+    unwrap_speech_encoder_model,
+    warmup_speech_encoder,
 )
+from vllm.config import CUDAGraphMode
 from vllm.config.compilation import CompilationConfig
 
 pytestmark = pytest.mark.cpu_test
@@ -362,6 +367,59 @@ def test_maybe_compile_can_defer_until_after_kv():
     assert compile_pending_speech_encoder_layers(model) == 0
 
 
+def test_pending_compile_survives_cudagraph_wrapper(monkeypatch: pytest.MonkeyPatch):
+    """Delattr on CUDAGraphWrapper does not forward; unwrap / side table must."""
+    monkeypatch.setattr(
+        "vllm.compilation.cuda_graph.current_platform.get_global_graph_pool",
+        lambda: object(),
+    )
+    model = _SpeechModel()
+    maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=True), defer=True)
+    wrapper = CUDAGraphWrapper(
+        model,
+        SimpleNamespace(compilation_config=SimpleNamespace()),
+        runtime_mode=CUDAGraphMode.FULL,
+    )
+    assert unwrap_speech_encoder_model(wrapper) is model
+    assert getattr(wrapper, mm_encoder_mod._PENDING_LAYERS_ATTR)
+    with pytest.raises(AttributeError):
+        delattr(wrapper, mm_encoder_mod._PENDING_LAYERS_ATTR)
+    assert compile_pending_speech_encoder_layers(wrapper) == 3
+    assert model.perception.encoder.layers[0].compile_calls == 1
+    assert compile_pending_speech_encoder_layers(wrapper) == 0
+
+
+def test_pending_compile_setattr_on_already_wrapped_model(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "vllm.compilation.cuda_graph.current_platform.get_global_graph_pool",
+        lambda: object(),
+    )
+    model = _SpeechModel()
+    wrapper = CUDAGraphWrapper(
+        model,
+        SimpleNamespace(compilation_config=SimpleNamespace()),
+        runtime_mode=CUDAGraphMode.FULL,
+    )
+    maybe_compile_speech_mm_encoder(wrapper, _vllm_config(compile_mm=True), defer=True)
+    assert mm_encoder_mod._PENDING_LAYERS_ATTR not in vars(wrapper)
+    assert hasattr(model, mm_encoder_mod._PENDING_LAYERS_ATTR)
+    assert compile_pending_speech_encoder_layers(wrapper) == 3
+    assert not hasattr(model, mm_encoder_mod._PENDING_LAYERS_ATTR)
+
+
+def test_flex_decoding_guard_short_circuits_when_forced():
+    isolate_flex_attention_from_compile()
+    from torch._inductor.kernel.flex.flex_decoding import _use_flex_decoding
+
+    assert (
+        _use_flex_decoding(None, None, None, {"FORCE_USE_FLEX_ATTENTION": True}, False)
+        is False
+    )
+    assert _use_flex_decoding(None, None, None, {"BACKEND": "TRITON"}, False) is False
+
+
 def test_dynamo_recompile_limit_is_raised():
     configure_speech_encoder_dynamo()
     config = torch._dynamo.config
@@ -374,6 +432,7 @@ class _FakeGraphRunner:
         self.graphs: dict[tuple[int, int], object] = {}
         self.batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
         self.window = 550
+        self.max_frames = 2 * self.window
         self.max_rows_x_frames = 128 * 550
         self.enabled = True
         self.pool = None
@@ -512,4 +571,58 @@ def test_failed_graph_capture_falls_back_at_call(monkeypatch: pytest.MonkeyPatch
     assert runner(audio, lengths) is None
     assert runner.enabled is False
     assert runner(audio, lengths) is None
+    envs.disable_envs_cache()
+
+
+def test_warmup_captures_bi_buckets_after_kv(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 40)
+    envs.disable_envs_cache()
+    model = _SpeechModel()
+    runner = _FakeGraphRunner()
+    runner.window = 550
+    runner.max_frames = 550
+    model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(
+        model, _vllm_config(compile_mm=True, graphs=True), defer=True
+    )
+    assert warmup_speech_encoder(model) == 0.0
+    assert runner.capture_calls == []
+    enable_speech_encoder_after_kv(model)
+    assert model.perception.encoder.layers[0].compile_calls == 1
+    assert runner.capture_all_calls == 0
+    assert {rows for rows, _ in runner.capture_calls} == {1}
+    buckets = speech_encoder_warmup_frame_buckets(runner)
+    assert buckets == [256, 512]
+    assert {frames for _, frames in runner.capture_calls} == set(buckets)
+    n_captured = len(runner.capture_calls)
+    enable_speech_encoder_after_kv(model)
+    assert len(runner.capture_calls) == n_captured
+    envs.disable_envs_cache()
+
+
+def test_warmup_survives_cudagraph_wrapper(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 20)
+    monkeypatch.setattr(
+        "vllm.compilation.cuda_graph.current_platform.get_global_graph_pool",
+        lambda: object(),
+    )
+    envs.disable_envs_cache()
+    model = _SpeechModel()
+    runner = _FakeGraphRunner()
+    runner.window = 256
+    runner.max_frames = 256
+    model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(
+        model, _vllm_config(compile_mm=True, graphs=True), defer=True
+    )
+    wrapper = CUDAGraphWrapper(
+        model,
+        SimpleNamespace(compilation_config=SimpleNamespace()),
+        runtime_mode=CUDAGraphMode.FULL,
+    )
+    enable_speech_encoder_after_kv(wrapper)
+    assert model.perception.encoder.layers[0].compile_calls == 1
+    assert (1, 256) in runner.graphs
     envs.disable_envs_cache()

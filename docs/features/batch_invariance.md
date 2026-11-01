@@ -180,7 +180,8 @@ in the decode or prefill batch.
   graphs (`cudagraph_mm_encoder`, `VLLM_CUDAGRAPH_MM_ENCODER`, or
   `encoder_cuda_graphs`) are equivalent; they stay off unless any of
   those three is set. Under BI the default graph batch grid is `(1,)`,
-  compile and capture are deferred until after KV allocation, and the
+  compile and capture are deferred until after KV allocation, a post-KV
+  warmup compiles and captures batch-1 frame buckets, and the
   path is a function of each item's valid length.
 
 ### What you must disable (explicit errors, not silent)
