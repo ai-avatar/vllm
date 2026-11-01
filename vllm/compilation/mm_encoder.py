@@ -10,21 +10,25 @@ perception encoder is built outside that decorator. This module compiles
 not re-specialize, and it maps the official compilation flags onto the
 plugin's ``encoder_compile`` / ``encoder_cuda_graphs`` hf-overrides.
 
-Inductor must not trace ``flex_attention`` inside those blocks: its
-flex-decoding kernel (``Q`` length < 128 frames) is wrong for the
-encoder's rel-pos ``score_mod`` and padding ``block_mask``, and dynamo's
-eager backend captures the HOP as dense math. ``flex_attention`` keeps
-its own compiled kernel via a graph break. vLLM owns layer compile so
-the plugin cannot inductor-compile first under graphs.
+Inductor's flex-decoding kernel is wrong for this encoder's rel-pos
+``score_mod`` and padding ``block_mask`` when ``Q`` is shorter than 128
+frames. Flex stays inside the compiled graph with
+``FORCE_USE_FLEX_ATTENTION`` so the main flex kernel is used. Graph-
+breaking the NeMo ``_flex_attention_compiled`` wrapper is correct but
+~6× slower. vLLM owns layer compile so the plugin cannot
+``compile_layers`` first under graphs.
 
 Speech encoder CUDA graphs are captured lazily after KV allocation, with
 batch sizes ``(1,)`` under ``VLLM_BATCH_INVARIANT``. The replay path is a
 function of each item's valid length, not the padded tensor width.
+Layer compile is also deferred until after KV so inductor workspaces are
+not counted as peak activation.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import sys
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +46,7 @@ logger = init_logger(__name__)
 _COMPILED_ATTR = "_vllm_mm_encoder_compiled"
 _FLEX_ISOLATED_ATTR = "_vllm_speech_encoder_flex_isolated"
 _RUNNER_PATCH_ATTR = "_vllm_speech_graph_patched"
+_PENDING_LAYERS_ATTR = "_vllm_speech_encoder_pending_compile"
 _DYNAMO_CONFIGURED = False
 
 _NEMOTRON_SPEECH_ARCH_MARKERS = ("NeMoSpeechLM",)
@@ -153,44 +158,132 @@ def sync_mm_encoder_compile_flags(vllm_config: VllmConfig) -> None:
         )
 
 
-def isolate_flex_attention_from_compile() -> bool:
-    """Keep ``flex_attention`` outside compiled encoder regions.
+class SpeechEncoderGraphFallback(RuntimeError):
+    """Graph helper failed; ``__call__`` must return None (eager encode)."""
 
-    Inductor's flex-decoding path (``128 <= Q`` is false, i.e. fewer
-    than 128 encoder frames / 10.24 s) is wrong for this block's
-    rel-pos ``score_mod`` and padding ``block_mask``. Dynamo
-    ``backend="eager"`` instead captures the HOP and runs dense math.
-    Graph-breaking leaves ``flex_attention`` on its own compiled
-    kernel.
+
+def _force_flex_attention_kernel(fn: Any) -> Any:
+    """Wrap ``fn`` so inductor cannot pick flex-decoding for short Q."""
+    if fn is None or getattr(fn, _FLEX_ISOLATED_ATTR, False):
+        return fn
+
+    def wrapped(*args: Any, **kwargs: Any):
+        opts = dict(kwargs.get("kernel_options") or {})
+        opts["FORCE_USE_FLEX_ATTENTION"] = True
+        kwargs["kernel_options"] = opts
+        return fn(*args, **kwargs)
+
+    with contextlib.suppress(Exception):
+        wrapped = functools.update_wrapper(wrapped, fn)
+    setattr(wrapped, _FLEX_ISOLATED_ATTR, True)
+    return wrapped
+
+
+def _set_module_attr(module: Any, name: str, value: Any) -> None:
+    setattr(module, name, value)
+
+
+def _patch_get_flex_attention(getter: Any) -> Any:
+    if getter is None or getattr(getter, _FLEX_ISOLATED_ATTR, False):
+        return getter
+
+    def wrapped(q: Any, *args: Any, **kwargs: Any):
+        return _force_flex_attention_kernel(getter(q, *args, **kwargs))
+
+    with contextlib.suppress(Exception):
+        wrapped = functools.update_wrapper(wrapped, getter)
+    setattr(wrapped, _FLEX_ISOLATED_ATTR, True)
+    return wrapped
+
+
+def isolate_flex_attention_from_compile() -> bool:
+    """Force the non-decoding flex kernel on NeMo's compiled wrapper.
+
+    NeMo calls ``transformer_encoder_utils._get_flex_attention(q)``, which
+    returns import-time ``_flex_attention_compiled = torch.compile(
+    flex_attention, dynamic=True)``. Graph-breaking that wrapper is
+    correct (short-clip WER ~3.1%) but ~6× slower. Injecting
+    ``FORCE_USE_FLEX_ATTENTION`` keeps flex inside the inductor graph on
+    the main kernel.
+
+    Always re-scans loaded modules so a late NeMo import is still
+    patched.
 
     Returns:
-        True when the op was marked, or already isolated.
+        True when the global op was wrapped, or already wrapped.
 
     """
     try:
         import torch.nn.attention.flex_attention as flex_mod
     except ImportError:
-        return False
-    fn = getattr(flex_mod, "flex_attention", None)
-    if fn is None:
-        return False
-    if getattr(fn, _FLEX_ISOLATED_ATTR, False):
-        return True
-    # recursive=False: graph-break at the call, but let flex_attention
-    # keep its own compiled kernel. recursive=True would force dense math.
-    isolated = torch.compiler.disable(fn, recursive=False)
-    setattr(isolated, _FLEX_ISOLATED_ATTR, True)
-    flex_mod.flex_attention = isolated  # type: ignore[attr-defined]
+        flex_mod = None
+        fn = None
+    else:
+        fn = getattr(flex_mod, "flex_attention", None)
+    wrapped_global = False
+    if fn is not None:
+        isolated = _force_flex_attention_kernel(fn)
+        if isolated is not fn:
+            flex_mod.flex_attention = isolated
+            for module in list(sys.modules.values()):
+                if module is None:
+                    continue
+                try:
+                    if getattr(module, "flex_attention", None) is fn:
+                        module.flex_attention = isolated  # type: ignore[attr-defined]
+                except Exception:
+                    continue
+        wrapped_global = True
+        create_mask = getattr(flex_mod, "create_block_mask", None)
+        if create_mask is not None and not getattr(
+            create_mask, _FLEX_ISOLATED_ATTR, False
+        ):
+
+            def _create_mask_on_gpu(*args: Any, **kwargs: Any):
+                if kwargs.get("device") is None:
+                    with contextlib.suppress(Exception):
+                        kwargs["device"] = torch.device("cuda")
+                return create_mask(*args, **kwargs)
+
+            setattr(_create_mask_on_gpu, _FLEX_ISOLATED_ATTR, True)
+            flex_mod.create_block_mask = _create_mask_on_gpu
+            for module in list(sys.modules.values()):
+                if module is None:
+                    continue
+                try:
+                    if getattr(module, "create_block_mask", None) is create_mask:
+                        module.create_block_mask = (  # type: ignore[attr-defined]
+                            _create_mask_on_gpu
+                        )
+                except Exception:
+                    continue
 
     for module in list(sys.modules.values()):
         if module is None:
             continue
         try:
-            if getattr(module, "flex_attention", None) is fn:
-                module.flex_attention = isolated  # type: ignore[attr-defined]
+            compiled = getattr(module, "_flex_attention_compiled", None)
+            if compiled is not None:
+                _set_module_attr(
+                    module,
+                    "_flex_attention_compiled",
+                    _force_flex_attention_kernel(compiled),
+                )
+            compiled_alt = getattr(module, "flex_attention_compiled", None)
+            if compiled_alt is not None:
+                _set_module_attr(
+                    module,
+                    "flex_attention_compiled",
+                    _force_flex_attention_kernel(compiled_alt),
+                )
+            getter = getattr(module, "_get_flex_attention", None)
+            if callable(getter):
+                _set_module_attr(
+                    module, "_get_flex_attention", _patch_get_flex_attention(getter)
+                )
         except Exception:
             continue
-    return True
+    return wrapped_global
 
 
 def configure_speech_encoder_dynamo() -> None:
@@ -218,11 +311,10 @@ def configure_speech_encoder_dynamo() -> None:
 def speech_encoder_layer_compile_kwargs() -> dict[str, Any]:
     """Kwargs for ``nn.Module.compile`` on speech-encoder blocks.
 
-    Always inductor + dynamic shapes. ``flex_attention`` is isolated
-    first so inductor compiles LayerNorm / Linear / residual only and
-    cannot pick flex-decoding for short audio. Do not use
-    ``backend="eager"``: dynamo then captures the flex HOP as dense
-    math (~5× slower).
+    Always inductor + dynamic shapes. Flex stays in the graph with
+    ``FORCE_USE_FLEX_ATTENTION`` so short audio does not take
+    flex-decoding. Do not use ``backend="eager"``: dynamo then
+    captures the flex HOP as dense math (~5× slower).
     """
     return {"dynamic": True}
 
@@ -413,9 +505,13 @@ def configure_speech_encoder_graphs(
         for size in runner._split(processed.shape[0], bucket):
             if (size, bucket) not in runner.graphs:
                 if not getattr(runner, "_vllm_allow_capture", False):
-                    return None
+                    raise SpeechEncoderGraphFallback(
+                        "speech encoder graph capture is not enabled yet"
+                    )
                 try:
                     _capture_one_graph(runner, size, bucket, n_feat, processed.dtype)
+                except SpeechEncoderGraphFallback:
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "Speech encoder CUDA graph capture failed for "
@@ -426,7 +522,7 @@ def configure_speech_encoder_graphs(
                     )
                     runner.graphs.clear()
                     runner.enabled = False
-                    return None
+                    raise SpeechEncoderGraphFallback(str(exc)) from exc
         return orig_call_short(processed, processed_len, return_ctc_timestamp_inputs)
 
     def call_long(
@@ -458,21 +554,26 @@ def configure_speech_encoder_graphs(
             audio_signal, audio_lengths = _crop_to_valid_audio(
                 audio_signal, audio_lengths
             )
-            if (
-                envs.VLLM_BATCH_INVARIANT
-                and isinstance(audio_signal, torch.Tensor)
-                and audio_signal.shape[0] > 1
-                and not return_ctc_timestamp_inputs
-            ):
-                return _call_graph_runner_per_item(
-                    lambda audio, length, ctc: orig_cls_call(self, audio, length, ctc),
-                    audio_signal,
-                    audio_lengths,
-                    return_ctc_timestamp_inputs,
+            try:
+                if (
+                    envs.VLLM_BATCH_INVARIANT
+                    and isinstance(audio_signal, torch.Tensor)
+                    and audio_signal.shape[0] > 1
+                    and not return_ctc_timestamp_inputs
+                ):
+                    return _call_graph_runner_per_item(
+                        lambda audio, length, ctc: orig_cls_call(
+                            self, audio, length, ctc
+                        ),
+                        audio_signal,
+                        audio_lengths,
+                        return_ctc_timestamp_inputs,
+                    )
+                return orig_cls_call(
+                    self, audio_signal, audio_lengths, return_ctc_timestamp_inputs
                 )
-            return orig_cls_call(
-                self, audio_signal, audio_lengths, return_ctc_timestamp_inputs
-            )
+            except SpeechEncoderGraphFallback:
+                return None
 
         cls.__call__ = cls_call
         cls._vllm_speech_graph_call_wrapped = True
@@ -501,29 +602,7 @@ def enable_speech_encoder_graph_capture(model: nn.Module | None) -> None:
     logger.info_once("Speech encoder CUDA graphs enabled for lazy per-bucket capture.")
 
 
-def maybe_compile_speech_mm_encoder(model: nn.Module, vllm_config: VllmConfig) -> int:
-    """Compile speech-encoder layers when ``compile_mm_encoder`` is on.
-
-    Always prepares graph-runner patches (defer / lazy / item-pure path)
-    when the plugin built ``EncoderGraphRunner``. Layer compile is not
-    deferred to the plugin: vLLM compiles the same blocks after
-    isolating ``flex_attention``, including when graphs are on.
-
-    Returns the number of layers compiled.
-    """
-    configure_speech_encoder_graphs(model, vllm_config)
-    want_compile = bool(vllm_config.compilation_config.compile_mm_encoder)
-    if want_compile or getattr(model, "_encoder_graphs", None) is not None:
-        isolate_flex_attention_from_compile()
-        configure_speech_encoder_dynamo()
-
-    if not want_compile:
-        return 0
-
-    layers = collect_speech_encoder_layers(model)
-    if not layers:
-        return 0
-
+def _compile_speech_encoder_layers(model: nn.Module, layers: list[nn.Module]) -> int:
     compile_kwargs = speech_encoder_layer_compile_kwargs()
     compiled = 0
     dtype = _module_floating_dtype(model)
@@ -542,12 +621,72 @@ def maybe_compile_speech_mm_encoder(model: nn.Module, vllm_config: VllmConfig) -
                 continue
             setattr(layer, _COMPILED_ATTR, True)
             compiled += 1
-
     if compiled:
         logger.info(
             "Compiled %d speech-encoder layer(s) with dynamic shapes "
-            "(compile_mm_encoder=True, backend=inductor, flex_attention "
-            "isolated).",
+            "(compile_mm_encoder=True, backend=inductor, "
+            "FORCE_USE_FLEX_ATTENTION).",
             compiled,
         )
     return compiled
+
+
+def compile_pending_speech_encoder_layers(model: nn.Module | None) -> int:
+    """Compile layers deferred past memory profiling."""
+    if model is None:
+        return 0
+    isolate_flex_attention_from_compile()
+    layers = getattr(model, _PENDING_LAYERS_ATTR, None)
+    if not layers:
+        return 0
+    delattr(model, _PENDING_LAYERS_ATTR)
+    compiled = _compile_speech_encoder_layers(model, layers)
+    if compiled:
+        with contextlib.suppress(Exception):
+            torch.accelerator.empty_cache()
+    return compiled
+
+
+def enable_speech_encoder_after_kv(model: nn.Module | None) -> None:
+    """Compile deferred layers and allow lazy graph capture after KV."""
+    compile_pending_speech_encoder_layers(model)
+    enable_speech_encoder_graph_capture(model)
+
+
+def maybe_compile_speech_mm_encoder(
+    model: nn.Module, vllm_config: VllmConfig, *, defer: bool = False
+) -> int:
+    """Compile speech-encoder layers when ``compile_mm_encoder`` is on.
+
+    Always prepares graph-runner patches (defer / lazy / item-pure path)
+    when the plugin built ``EncoderGraphRunner``. Layer compile is not
+    deferred to the plugin: vLLM compiles the same blocks after forcing
+    the non-decoding flex kernel, including when graphs are on.
+
+    When ``defer`` is True (model runners), ``layer.compile`` runs after
+    KV allocation so inductor workspaces are not counted as peak
+    activation.
+
+    Returns the number of layers compiled now (0 when deferred).
+    """
+    configure_speech_encoder_graphs(model, vllm_config)
+    want_compile = bool(vllm_config.compilation_config.compile_mm_encoder)
+    if want_compile or getattr(model, "_encoder_graphs", None) is not None:
+        isolate_flex_attention_from_compile()
+        configure_speech_encoder_dynamo()
+
+    if not want_compile:
+        return 0
+
+    layers = collect_speech_encoder_layers(model)
+    if not layers:
+        return 0
+    if defer:
+        setattr(model, _PENDING_LAYERS_ATTR, layers)
+        logger.info(
+            "Deferring compile of %d speech-encoder layer(s) until after "
+            "KV allocation.",
+            len(layers),
+        )
+        return 0
+    return _compile_speech_encoder_layers(model, layers)

@@ -422,7 +422,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         from vllm.compilation.mm_encoder import maybe_compile_speech_mm_encoder
 
-        maybe_compile_speech_mm_encoder(self.model, self.vllm_config)
+        maybe_compile_speech_mm_encoder(self.model, self.vllm_config, defer=True)
 
         self.model_memory_usage = m.consumed_memory
         logger.info(
@@ -807,11 +807,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.model, self.vllm_config, kv_cache_config
                 )
 
-            from vllm.compilation.mm_encoder import (
-                enable_speech_encoder_graph_capture,
-            )
+            from vllm.compilation.mm_encoder import enable_speech_encoder_after_kv
 
-            enable_speech_encoder_graph_capture(self.model)
+            enable_speech_encoder_after_kv(self.model)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""

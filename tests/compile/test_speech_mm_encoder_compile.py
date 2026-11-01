@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests for SpeechLM / Nemotron Transcribe encoder compile wiring."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -12,9 +13,11 @@ import vllm.envs as envs
 from vllm.compilation import mm_encoder as mm_encoder_mod
 from vllm.compilation.mm_encoder import (
     collect_speech_encoder_layers,
+    compile_pending_speech_encoder_layers,
     configure_speech_encoder_dynamo,
     configure_speech_encoder_graphs,
     default_speech_encoder_graph_batch_sizes,
+    enable_speech_encoder_after_kv,
     enable_speech_encoder_graph_capture,
     is_nemo_speechlm_config,
     isolate_flex_attention_from_compile,
@@ -317,6 +320,48 @@ def test_isolate_flex_attention_marks_the_op():
     assert getattr(flex_attention, mm_encoder_mod._FLEX_ISOLATED_ATTR)
 
 
+def test_patches_nemo_compiled_flex_wrapper(monkeypatch: pytest.MonkeyPatch):
+    import types
+
+    recorded: dict[str, dict] = {}
+
+    def fake_compiled(*args, **kwargs):
+        recorded["opts"] = dict(kwargs.get("kernel_options") or {})
+        return args[0] if args else None
+
+    def fake_get(q):
+        return fake_mod._flex_attention_compiled  # type: ignore[attr-defined]
+
+    fake_mod = types.ModuleType(
+        "nemo.collections.asr.modules.transformer_encoder_utils"
+    )
+    fake_mod._flex_attention_compiled = fake_compiled  # type: ignore[attr-defined]
+    fake_mod._get_flex_attention = fake_get  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, fake_mod.__name__, fake_mod)
+
+    isolate_flex_attention_from_compile()
+    compiled = fake_mod._flex_attention_compiled  # type: ignore[attr-defined]
+    assert getattr(compiled, mm_encoder_mod._FLEX_ISOLATED_ATTR)
+    compiled(object())
+    assert recorded["opts"]["FORCE_USE_FLEX_ATTENTION"] is True
+    wrapped_get = fake_mod._get_flex_attention  # type: ignore[attr-defined]
+    assert getattr(wrapped_get, mm_encoder_mod._FLEX_ISOLATED_ATTR)
+    wrapped_get(None)(object())
+    assert recorded["opts"]["FORCE_USE_FLEX_ATTENTION"] is True
+
+
+def test_maybe_compile_can_defer_until_after_kv():
+    model = _SpeechModel()
+    compiled = maybe_compile_speech_mm_encoder(
+        model, _vllm_config(compile_mm=True), defer=True
+    )
+    assert compiled == 0
+    assert model.perception.encoder.layers[0].compile_calls == 0
+    assert compile_pending_speech_encoder_layers(model) == 3
+    assert model.perception.encoder.layers[0].compile_calls == 1
+    assert compile_pending_speech_encoder_layers(model) == 0
+
+
 def test_dynamo_recompile_limit_is_raised():
     configure_speech_encoder_dynamo()
     config = torch._dynamo.config
@@ -446,4 +491,25 @@ def test_graphs_path_is_per_item_under_bi(monkeypatch: pytest.MonkeyPatch):
     assert out == ["short", "short"]
     assert runner.short_frames == [1600, 4096]
     assert runner.capture_all_calls == 0
+    envs.disable_envs_cache()
+
+
+def test_failed_graph_capture_falls_back_at_call(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    envs.disable_envs_cache()
+    model = _SpeechModel()
+    runner = _FakeGraphRunner()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("Cannot copy between CPU and CUDA tensors")
+
+    runner._capture = boom  # type: ignore[method-assign]
+    model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=False, graphs=True))
+    enable_speech_encoder_after_kv(model)
+    audio = torch.zeros(1, 1600)
+    lengths = torch.tensor([1600])
+    assert runner(audio, lengths) is None
+    assert runner.enabled is False
+    assert runner(audio, lengths) is None
     envs.disable_envs_cache()

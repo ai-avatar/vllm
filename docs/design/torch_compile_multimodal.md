@@ -33,9 +33,9 @@ vllm serve <nemotron-transcribe> --hf-overrides '{"encoder_compile": true}'
 In-tree vision encoders compile through `@support_torch_compile`. The NeMo
 SpeechLM `perception.encoder` transformer blocks (including Sortformer when
 the plugin mounts it there) are compiled after load with dynamic shapes so
-variable audio lengths do not re-specialize. `flex_attention` stays
-outside that compiled region. The projector / `modality_adapter` stay
-eager.
+variable audio lengths do not re-specialize. Flex stays in the compiled
+graph with `FORCE_USE_FLEX_ATTENTION` so short clips do not take
+flex-decoding. The projector / `modality_adapter` stay eager.
 
 ## How Compilation Works for Multimodal Components
 
@@ -97,12 +97,14 @@ VLLM_CUDAGRAPH_MM_ENCODER=1   # also accepts true/false
 
 The effective graph flag is written back to both `compilation_config` and
 the SpeechLM hf config. vLLM compiles `perception.encoder` blocks itself
-(the plugin `encoder_compile` flag is an input only) after isolating
-`flex_attention` so inductor cannot pick flex-decoding for inputs shorter
-than 128 encoder frames (10.24 s). Graph capture is deferred until after
-KV allocation and is lazy per `(batch, bucket)`. Under
-`VLLM_BATCH_INVARIANT=1` the default batch grid is `(1,)` and the replay
-path is a function of each item's valid length.
+(the plugin `encoder_compile` flag is an input only) after forcing
+`FORCE_USE_FLEX_ATTENTION` on NeMo's `_flex_attention_compiled` /
+`_get_flex_attention` so inductor cannot pick flex-decoding for inputs
+shorter than 128 encoder frames (10.24 s). Layer compile and graph
+capture are deferred until after KV allocation; capture is lazy per
+`(batch, bucket)`. Under `VLLM_BATCH_INVARIANT=1` the default batch
+grid is `(1,)` and the replay path is a function of each item's valid
+length.
 
 ```bash
 VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \
