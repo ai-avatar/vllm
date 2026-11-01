@@ -127,10 +127,10 @@ watch inspects only the `CodeType` dynamo is compiling
 capture (`activation.forward_native`, `grouped_topk`) is silent.
 The timestamp aligner is
 `torch.compiler.disable`'d so it cannot add unique_graphs. It uses
-an isolated BlockMask / valid-length cache. A timestamps request's
-transcription pass forces `return_ctc_timestamp_inputs=False` into
-the plugin (`_call_long` / `__call__` / `perception.forward`) so
-T=1512 (121 s) cannot skip graphs or change padding. A
+an isolated BlockMask / valid-length cache. Graph runners set
+`ctc_timestamp_inputs` so a timestamps request replays the same
+graphs as plain and still returns `(embeddings, states)`. Compile-off
+does not wrap `perception.forward` or rewrite that arity. A
 profile dummy with `window=max_frames` (e.g. 4000) does not pad a
 500-frame slice to 4000, and warmup also runs the
 `(1, n_feat, 3 * max_frames)` dummy `profile_run` still forwards.

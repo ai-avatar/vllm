@@ -385,18 +385,44 @@ def _as_pos_int(value: Any) -> int | None:
         return None
 
 
-def _serving_ctc_flag(requested: bool) -> bool:
-    """CTC extras are only for the post-transcription aligner.
-
-    The plugin's ``_call_long(..., True)`` / ``__call__(..., True)``
-    skips CUDA graphs or changes windowing/padding. A timestamps
-    request must still transcribe on the same compiled path as plain.
-    """
+def _aligner_ctc_request(requested: bool) -> bool:
+    """True when this is the post-transcription aligner, not serving encode."""
     if not requested:
         return False
     if _ALIGNER_ACTIVE:
         return True
     return not _is_inference_mode()
+
+
+def _enable_runner_ctc_states(runner: Any, model: Any = None) -> None:
+    """Capture CTC alignment inputs on the same graphs as plain encodes.
+
+    The plugin returns None from ``__call__(..., True)`` unless
+    ``ctc_timestamp_inputs`` was set before capture. That None forces
+    ``perception.forward(True)`` — a different encode than graphed
+    plain. Enable the flag so timestamps replay the same graphs and
+    still return ``(embeddings, states)``.
+    """
+    if runner is None or not hasattr(runner, "ctc_timestamp_inputs"):
+        return
+    perception = getattr(runner, "perception", None)
+    if perception is None and model is not None:
+        inner = unwrap_speech_encoder_model(model)
+        perception = getattr(inner, "perception", None)
+    fwd = getattr(perception, "forward", None)
+    if callable(fwd):
+        try:
+            import inspect
+
+            params = inspect.signature(fwd).parameters
+            accepts = "return_ctc_timestamp_inputs" in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            if not accepts:
+                return
+        except (TypeError, ValueError):
+            pass
+    runner.ctc_timestamp_inputs = True
 
 
 def _hash_encoder_result(result: Any) -> str | None:
@@ -1717,7 +1743,6 @@ def _wrap_speech_encoder_inference(model: Any) -> bool:
     def wrapped(*args: Any, **kwargs: Any):
         with _encoder_dtype_runtime(), _speech_encoder_runtime():
             args, kwargs = _promote_to_inference(args, kwargs)
-            args, kwargs = _force_serving_ctc_args(args, kwargs)
             _prime_mask_from_call_args(args, kwargs)
             if _ALIGNER_ACTIVE:
                 with _force_eager_compute():
@@ -1728,53 +1753,6 @@ def _wrap_speech_encoder_inference(model: Any) -> bool:
         wrapped = functools.update_wrapper(wrapped, orig)
     encoder.forward = wrapped
     setattr(encoder, _ENCODER_WRAP_ATTR, True)
-    _wrap_speech_perception_ctc(inner if inner is not None else model)
-    return True
-
-
-_PERCEPTION_WRAP_ATTR = "_vllm_speech_perception_ctc_wrapped"
-
-
-def _force_serving_ctc_args(
-    args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Drop CTC extras on the serving transcription pass."""
-    requested = bool(kwargs.get("return_ctc_timestamp_inputs", False))
-    if len(args) >= 3 and isinstance(args[2], bool):
-        requested = bool(args[2])
-    serving = _serving_ctc_flag(requested)
-    if serving == requested:
-        return args, kwargs
-    kwargs = dict(kwargs)
-    if "return_ctc_timestamp_inputs" in kwargs:
-        kwargs["return_ctc_timestamp_inputs"] = serving
-    if len(args) >= 3 and isinstance(args[2], bool):
-        args_list = list(args)
-        args_list[2] = serving
-        args = tuple(args_list)
-    return args, kwargs
-
-
-def _wrap_speech_perception_ctc(model: Any) -> bool:
-    """Force perception.forward onto the plain transcription path when serving."""
-    inner = unwrap_speech_encoder_model(model) if model is not None else None
-    if inner is None:
-        inner = model
-    perception = getattr(inner, "perception", None)
-    if perception is None or getattr(perception, _PERCEPTION_WRAP_ATTR, False):
-        return False
-    orig = getattr(perception, "forward", None)
-    if not callable(orig):
-        return False
-
-    def wrapped(*args: Any, **kwargs: Any):
-        args, kwargs = _force_serving_ctc_args(args, kwargs)
-        return orig(*args, **kwargs)
-
-    with contextlib.suppress(Exception):
-        wrapped = functools.update_wrapper(wrapped, orig)
-    perception.forward = wrapped
-    setattr(perception, _PERCEPTION_WRAP_ATTR, True)
     return True
 
 
@@ -1863,6 +1841,7 @@ def configure_speech_encoder_graphs(
             runner.max_rows_x_frames = sizes[-1] * int(runner.window)
 
     runner._vllm_allow_capture = False
+    _enable_runner_ctc_states(runner, model)
     orig_call_short = runner._call_short
     orig_call_long = getattr(runner, "_call_long", None)
     orig_cls_call = type(runner).__call__
@@ -1893,12 +1872,11 @@ def configure_speech_encoder_graphs(
     ):
         processed = _prepare_processed(processed, processed_len, runner, long=False)
         _record_encoder_path("short", processed, processed_len)
-        serving_ctc = _serving_ctc_flag(return_ctc_timestamp_inputs)
-        # Timestamps add a CTC aligner *after* transcription. The
-        # serving encode (inference_mode) must stay on the same
-        # compiled / graphed path as plain — pass False into the
-        # plugin so it cannot skip graphs / change padding.
-        if serving_ctc:
+        # Serving transcription (inference_mode) uses the same graphs as
+        # plain. Pass the CTC flag through so the plugin still returns
+        # ``(embeddings, states)`` from those graphs. Eager-route only
+        # the post-transcription aligner.
+        if _aligner_ctc_request(return_ctc_timestamp_inputs):
             with _aligner_runtime(), _force_eager_compute():
                 _prime_mask_from_processed(processed, processed_len)
                 result = _disable_dynamo_fn(orig_call_short)(
@@ -1908,7 +1886,7 @@ def configure_speech_encoder_graphs(
                     "short",
                     processed,
                     processed_len,
-                    requested_ctc=return_ctc_timestamp_inputs,
+                    requested_ctc=True,
                     serving_ctc=True,
                     result=result,
                 )
@@ -1947,7 +1925,7 @@ def configure_speech_encoder_graphs(
                         runner.graphs.clear()
                         runner.enabled = False
                     raise SpeechEncoderGraphFallback(str(exc)) from exc
-        result = orig_call_short(processed, processed_len, False)
+        result = orig_call_short(processed, processed_len, return_ctc_timestamp_inputs)
         _log_encoder_decision(
             "short",
             processed,
@@ -1967,8 +1945,7 @@ def configure_speech_encoder_graphs(
             processed = _prepare_processed(processed, processed_len, runner, long=True)
             _record_encoder_path("long", processed, processed_len)
             assert orig_call_long is not None
-            serving_ctc = _serving_ctc_flag(return_ctc_timestamp_inputs)
-            if serving_ctc:
+            if _aligner_ctc_request(return_ctc_timestamp_inputs):
                 with _aligner_runtime(), _force_eager_compute():
                     _prime_mask_from_processed(processed, processed_len)
                     result = _disable_dynamo_fn(orig_call_long)(
@@ -1978,13 +1955,15 @@ def configure_speech_encoder_graphs(
                         "long",
                         processed,
                         processed_len,
-                        requested_ctc=return_ctc_timestamp_inputs,
+                        requested_ctc=True,
                         serving_ctc=True,
                         result=result,
                     )
                     return result
             _prime_mask_from_processed(processed, processed_len)
-            result = orig_call_long(processed, processed_len, False)
+            result = orig_call_long(
+                processed, processed_len, return_ctc_timestamp_inputs
+            )
             _log_encoder_decision(
                 "long",
                 processed,
@@ -2015,13 +1994,12 @@ def configure_speech_encoder_graphs(
             audio_signal, audio_lengths = _crop_to_valid_audio(
                 audio_signal, audio_lengths
             )
-            serving_ctc = _serving_ctc_flag(return_ctc_timestamp_inputs)
             try:
                 if (
                     envs.VLLM_BATCH_INVARIANT
                     and isinstance(audio_signal, torch.Tensor)
                     and audio_signal.shape[0] > 1
-                    and not serving_ctc
+                    and not return_ctc_timestamp_inputs
                 ):
                     return _call_graph_runner_per_item(
                         lambda audio, length, ctc: orig_cls_call(
@@ -2031,7 +2009,9 @@ def configure_speech_encoder_graphs(
                         audio_lengths,
                         False,
                     )
-                return orig_cls_call(self, audio_signal, audio_lengths, serving_ctc)
+                return orig_cls_call(
+                    self, audio_signal, audio_lengths, return_ctc_timestamp_inputs
+                )
             except SpeechEncoderGraphFallback:
                 return None
 
@@ -2534,10 +2514,22 @@ def enable_speech_encoder_after_kv(model: nn.Module | None) -> SpeechEncoderWarm
     if isinstance(inner, nn.Module):
         dtype = _module_floating_dtype(inner)
     remember_speech_encoder_default_dtype(inner, dtype)
+    runner = getattr(inner, "_encoder_graphs", None)
+    # Compile-off / graphs-off must not wrap encoder.forward: that path
+    # has to stay byte-identical to the uncompiled plugin (profile_run).
+    want_wrap = bool(
+        getattr(runner, _RUNNER_PATCH_ATTR, False)
+        or getattr(inner, _PENDING_LAYERS_ATTR, None)
+        or getattr(model, _PENDING_LAYERS_ATTR, None)
+    )
+    if not want_wrap:
+        with contextlib.suppress(TypeError, KeyError):
+            want_wrap = bool(_PENDING_LAYERS.get(inner) or _PENDING_LAYERS.get(model))
     with _pin_default_dtype(dtype):
         compile_pending_speech_encoder_layers(model)
         enable_speech_encoder_graph_capture(model)
-        _wrap_speech_encoder_inference(inner)
+        if want_wrap:
+            _wrap_speech_encoder_inference(inner)
         return warmup_speech_encoder(model)
 
 
@@ -2559,12 +2551,17 @@ def maybe_compile_speech_mm_encoder(
     """
     configure_speech_encoder_graphs(model, vllm_config)
     remember_speech_encoder_default_dtype(model)
-    _wrap_speech_encoder_inference(model)
     want_compile = bool(vllm_config.compilation_config.compile_mm_encoder)
+    want_graphs = bool(
+        getattr(vllm_config.compilation_config, "cudagraph_mm_encoder", False)
+    )
+    # Compile-off / graphs-off must not wrap perception or rewrite CTC
+    # arity: profile_run unpacks ``(embeddings, states)``.
+    if want_compile or want_graphs:
+        _wrap_speech_encoder_inference(model)
     if want_compile or getattr(model, "_encoder_graphs", None) is not None:
         isolate_flex_attention_from_compile()
         configure_speech_encoder_dynamo()
-        _wrap_speech_encoder_inference(model)
 
     if not want_compile:
         return 0

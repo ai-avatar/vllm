@@ -691,7 +691,7 @@ def test_call_long_1512_timestamp_flag_matches_plain():
         out_ts = runner._call_long(processed, processed_len, True)
     left = out_plain[0] if isinstance(out_plain, tuple) else out_plain
     right = out_ts[0] if isinstance(out_ts, tuple) else out_ts
-    assert runner.flags == [False, False]
+    assert runner.flags == [False, True]
     assert torch.equal(left, right)
     mm_encoder_mod._MASK_STATE.clear()
     envs.disable_envs_cache()

@@ -526,6 +526,8 @@ class _FakeGraphRunner:
         self.long_frames: list[int] = []
         self._vllm_closed_shapes = False
         self._vllm_allow_capture = False
+        self.ctc_timestamp_inputs = False
+        self.perception = None
 
     def _capture_all(self, n_feat: int, dtype: torch.dtype) -> None:
         self.capture_all_calls += 1
@@ -559,6 +561,8 @@ class _FakeGraphRunner:
         self.short_frames.append(processed.shape[2])
         bucket = self._frame_bucket(processed.shape[2])
         assert (processed.shape[0], bucket) in self.graphs
+        if return_ctc_timestamp_inputs:
+            return ["short"], {"states": True}
         return ["short"], None
 
     def _call_long(
@@ -573,6 +577,8 @@ class _FakeGraphRunner:
                 f"n_frame) but got last dimension {processed.shape[1]}"
             )
         self.long_frames.append(processed.shape[2])
+        if return_ctc_timestamp_inputs:
+            return ["long"], {"states": True}
         return ["long"], None
 
     def __call__(
@@ -581,6 +587,10 @@ class _FakeGraphRunner:
         audio_lengths: torch.Tensor,
         return_ctc_timestamp_inputs: bool = False,
     ):
+        # Match the plugin: timestamps without capture-time CTC fall
+        # through to perception.forward (a different encode).
+        if return_ctc_timestamp_inputs and not self.ctc_timestamp_inputs:
+            return None
         if not self.graphs and not self._capture_or_disable(
             self.feat_in, torch.float32
         ):
@@ -1370,14 +1380,14 @@ def test_timestamp_flag_in_inference_mode_stays_on_graph_path(
         runner._call_long(processed, processed_len, True)
         runner._call_long(processed, processed_len, False)
     assert entered == [False, False]
-    assert flags == [False, False]
+    assert flags == [True, False]
     envs.disable_envs_cache()
 
 
-def test_call_long_1512_drops_ctc_flag_in_inference_mode(
+def test_call_long_1512_plain_and_timestamps_embeddings_match(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """T=1512 (121 s long path) must pass False into the plugin when serving."""
+    """T=1512 (121 s): same graphed encode; True still returns states."""
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     envs.disable_envs_cache()
     model = _SpeechModel()
@@ -1396,11 +1406,13 @@ def test_call_long_1512_drops_ctc_flag_in_inference_mode(
     processed = torch.zeros(1, 128, 1512)
     processed_len = torch.tensor([1512])
     with torch.inference_mode():
-        runner._call_long(processed, processed_len, False)
-        runner._call_long(processed, processed_len, True)
-    assert flags == [False, False]
+        plain = runner._call_long(processed, processed_len, False)
+        ts = runner._call_long(processed, processed_len, True)
+    assert flags == [False, True]
+    assert plain[0] == ts[0] == ["long"]
+    assert ts[1] is not None
+    assert runner.long_frames[0] == runner.long_frames[1]
     assert mm_encoder_mod._LAST_ENCODER_DECISION.get("path") == "long"
-    assert mm_encoder_mod._LAST_ENCODER_DECISION.get("serving_ctc") is False
     assert mm_encoder_mod._LAST_ENCODER_DECISION.get("requested_ctc") is True
     envs.disable_envs_cache()
 
@@ -1508,3 +1520,140 @@ def test_warmup_captures_long_window_graphs(monkeypatch: pytest.MonkeyPatch):
     assert all(rows == 1 for rows, _ in runner.capture_calls)
     assert min(runner.long_frames) > 1100
     envs.disable_envs_cache()
+
+
+class _CtcPerception(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = nn.Module()
+        self.encoder.feat_in = 128
+        self.encoder.layers = nn.ModuleList()
+
+    def forward(
+        self,
+        input_signal=None,
+        input_signal_length=None,
+        processed_signal=None,
+        processed_signal_length=None,
+        return_ctc_timestamp_inputs: bool = False,
+        **kwargs,
+    ):
+        src = processed_signal if processed_signal is not None else input_signal
+        batch = src.shape[0] if isinstance(src, torch.Tensor) else 1
+        embs = torch.zeros(batch, 4)
+        lens = torch.full((batch,), 4)
+        if return_ctc_timestamp_inputs:
+            return embs, lens, {"ctc": True}
+        return embs, lens
+
+
+class _SpeechCtcModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.perception = _CtcPerception()
+
+
+def _plugin_encode_with_ctc_capture(model, audio, lengths, want_states: bool):
+    """Mirror salm/model.py: unpack ``(embeddings, states)`` when want_states."""
+    graphs = getattr(model, "_encoder_graphs", None)
+    encoded = None
+    if graphs is not None:
+        encoded = graphs(audio, lengths, want_states)
+    if encoded is None:
+        audio_embs, audio_emb_lens, *states = model.perception(
+            input_signal=audio,
+            input_signal_length=lengths,
+            return_ctc_timestamp_inputs=want_states,
+        )
+        audio_embeds = [audio_embs]
+        encoded = (audio_embeds, *states) if want_states else audio_embeds
+    if not want_states:
+        return encoded
+    audio_embeds, alignment_states = encoded
+    return audio_embeds, alignment_states
+
+
+def test_compile_off_does_not_wrap_perception_or_rewrite_ctc():
+    """Compile-off must keep perception.forward arity (startup profile_run)."""
+    model = _SpeechCtcModel()
+    maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=False, graphs=False))
+    enable_speech_encoder_after_kv(model)
+    assert type(model.perception).forward is _CtcPerception.forward
+    assert not getattr(
+        model.perception.encoder, mm_encoder_mod._ENCODER_WRAP_ATTR, False
+    )
+    with torch.inference_mode():
+        out = model.perception(
+            input_signal=torch.zeros(1, 8),
+            input_signal_length=torch.tensor([8]),
+            return_ctc_timestamp_inputs=True,
+        )
+    embs, lens, states = out
+    assert states == {"ctc": True}
+    assert embs.shape[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("compile_mm", "graphs"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_profile_run_want_states_returns_2tuple(compile_mm: bool, graphs: bool):
+    """Startup profile_run unpacks (embeddings, states) with compile on and off."""
+    model = _SpeechCtcModel()
+    runner = None
+    if graphs:
+        runner = _FakeGraphRunner()
+        model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(
+        model, _vllm_config(compile_mm=compile_mm, graphs=graphs)
+    )
+    enable_speech_encoder_after_kv(model)
+    if graphs:
+        audio = torch.zeros(1, 64)
+        lengths = torch.tensor([64])
+    else:
+        audio = torch.zeros(1, 8)
+        lengths = torch.tensor([8])
+    with torch.inference_mode():
+        encoded = _plugin_encode_with_ctc_capture(model, audio, lengths, True)
+    audio_embeds, alignment_states = encoded
+    assert alignment_states is not None
+    assert audio_embeds is not None
+    if graphs:
+        assert runner is not None
+        assert runner.ctc_timestamp_inputs is True
+        assert alignment_states == {"states": True}
+    else:
+        assert alignment_states == {"ctc": True}
+
+
+def test_engine_smoke_compile_off_and_on_profile_ctc():
+    """Mocked engine load: profile-style CTC capture works compile off and on."""
+    for compile_mm, graphs in ((False, False), (True, True)):
+        model = _SpeechCtcModel()
+        if graphs:
+            model._encoder_graphs = _FakeGraphRunner()
+        maybe_compile_speech_mm_encoder(
+            model, _vllm_config(compile_mm=compile_mm, graphs=graphs)
+        )
+        enable_speech_encoder_after_kv(model)
+        if graphs:
+            assert model._encoder_graphs.ctc_timestamp_inputs is True
+            audio = torch.zeros(1, 32)
+            lengths = torch.tensor([32])
+        else:
+            assert type(model.perception).forward is _CtcPerception.forward
+            audio = torch.zeros(1, 8)
+            lengths = torch.tensor([8])
+        with torch.inference_mode():
+            embs, states = _plugin_encode_with_ctc_capture(model, audio, lengths, True)
+        assert states is not None
+        assert embs is not None
+
+
+def test_enable_runner_ctc_states_when_perception_accepts_flag():
+    model = _SpeechCtcModel()
+    runner = _FakeGraphRunner()
+    runner.perception = model.perception
+    mm_encoder_mod._enable_runner_ctc_states(runner, model)
+    assert runner.ctc_timestamp_inputs is True

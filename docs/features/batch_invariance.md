@@ -197,9 +197,10 @@ in the decode or prefill batch.
   The timestamp aligner is `torch.compiler.disable`'d (no new
   unique_graphs) and keeps its own BlockMask / valid-length
   tensors so it cannot mutate the next compiled encode. A
-  timestamp request's transcription pass forces
-  `return_ctc_timestamp_inputs=False` into the plugin so it uses
-  the same compiled graphs as plain (including T=1512 / 121 s). Flex
+  timestamp request replays the same compiled graphs as plain
+  (including T=1512 / 121 s) and still returns CTC alignment
+  states from those graphs. Compile-off does not wrap
+  `perception.forward` or rewrite that arity. Flex
   compiles with `dynamic=False`. The path is a function of each item's
   valid length. Compiled encoder / flex kernels pin inductor
   `deterministic` (and disable timing `max_autotune` /
