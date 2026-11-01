@@ -519,16 +519,41 @@ class CompilationConfig:
     If empty list [], no ops are excluded (suitable for full cudagraphs)."""
     compile_mm_encoder: bool = False
     """Whether or not to compile the multimodal encoder.
-    Currently, this only works for `Qwen2_5_vl` and `mLLaMa4` models on selected
-    platforms. It may also work for models loaded with the Transformers modeling backend
-    if the encoder is compilable. Disabled by default until more models are
-    supported/tested to work."""
+
+    Off by default. Enable with ``--compilation-config '{"compile_mm_encoder":
+    true}'`` or ``VLLM_COMPILE_MM_ENCODER=1`` (also accepts true/false).
+    In-tree vision encoders that already use
+    ``@support_torch_compile(enable_if=should_torch_compile_mm_encoder)``
+    (Qwen2.5-VL, mLLaMA4, …) compile through that decorator. NeMo SpeechLM /
+    Nemotron Transcribe compiles ``perception.encoder`` blocks after load
+    with dynamic shapes. Flex stays in the graph with
+    ``FORCE_USE_FLEX_ATTENTION`` so inductor cannot pick flex-decoding
+    for short audio. Compile is deferred until after KV allocation.
+    Graph warmup captures buckets with ``n_feat`` from the preprocessor
+    / encoder; compile-only skips dummy-audio warmup.
+    vLLM owns that compile; the plugin hf-override ``encoder_compile``
+    is an input only.
+    """
 
     # Vision encoder CUDA graph
     cudagraph_mm_encoder: bool = False
     """Enable CUDA graph capture for multimodal encoder (ViT).
     When enabled, captures full encoder forward as CUDA graph
-    for each token budget level."""
+    for each token budget level.
+
+    For NeMo SpeechLM this is equivalent to ``VLLM_CUDAGRAPH_MM_ENCODER=1``
+    and hf ``encoder_cuda_graphs``; any of the three enables the plugin's
+    ``EncoderGraphRunner``. The effective value is written back to both
+    configs. Capture and layer compile are deferred until after KV
+    allocation, then a post-KV warmup captures every (batch, bucket)
+    with the preprocessor's ``n_feat`` and a compact long-audio
+    window-graph set. Capture of a later missing bucket is still lazy.
+    Under
+    ``VLLM_BATCH_INVARIANT`` the default batch grid is ``(1,)``. vLLM's
+    vision
+    ``EncoderCudaGraphManager`` is used only when the model implements
+    ``SupportsEncoderCudaGraph``.
+    """
 
     encoder_cudagraph_token_budgets: list[int] = field(default_factory=list)
     """Token budget levels for encoder CUDA graph capture.
@@ -913,6 +938,11 @@ class CompilationConfig:
         return handler(value)
 
     def __post_init__(self) -> None:
+        if envs.VLLM_COMPILE_MM_ENCODER:
+            self.compile_mm_encoder = True
+        if envs.VLLM_CUDAGRAPH_MM_ENCODER:
+            self.cudagraph_mm_encoder = True
+
         # TODO(zou3519/luka): There are 2 issues with auto-functionalization V2:
         # 1. A bug in PyTorch, fixed in 2.7:
         #    https://github.com/pytorch/pytorch/issues/147924

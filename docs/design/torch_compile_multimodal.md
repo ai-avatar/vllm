@@ -17,8 +17,25 @@ turning compile on for multimodal encoders, bringing performance improvements to
 When applied to the vision block of [`Qwen2_5_vl`](https://github.com/vllm-project/vllm/pull/23207) we observe ~4.5% e2e perf improvements with
 some increase in compilation time
 
-This feature is off by default, but can be enabled by setting `compile_mm_encoder: true` in the compilation config when models have the
-`@support_torch_compile` decorator.
+This feature is off by default. Enable it with any of:
+
+```bash
+# Official compilation_config (preferred)
+vllm serve <model> --compilation-config '{"compile_mm_encoder": true}'
+
+# Env alias (same default-off flag)
+VLLM_COMPILE_MM_ENCODER=1 vllm serve <model>
+
+# NeMo SpeechLM / Nemotron Transcribe also accept the plugin hf-overrides
+vllm serve <nemotron-transcribe> --hf-overrides '{"encoder_compile": true}'
+```
+
+In-tree vision encoders compile through `@support_torch_compile`. The NeMo
+SpeechLM `perception.encoder` transformer blocks (including Sortformer when
+the plugin mounts it there) are compiled after load with dynamic shapes so
+variable audio lengths do not re-specialize. Flex stays in the compiled
+graph with `FORCE_USE_FLEX_ATTENTION` so short clips do not take
+flex-decoding. The projector / `modality_adapter` stay eager.
 
 ## How Compilation Works for Multimodal Components
 
@@ -64,7 +81,49 @@ shape can be difficult to infer due to the unspecified range of shapes the encod
 
 ### Cudagraphs
 
-We have not yet explored compilation for multimodal encoders with CUDAGraph integration; behavior is currently unspecified.
+Vision models that implement `SupportsEncoderCudaGraph` can capture
+`cudagraph_mm_encoder` graphs through `EncoderCudaGraphManager`
+(token-budget packing). That path is unchanged.
+
+Nemotron Transcribe / NeMo SpeechLM does **not** implement that protocol.
+These three flags are equivalent and all enable the plugin's
+`EncoderGraphRunner` (length-bucket graphs, pad + mask):
+
+```bash
+--compilation-config '{"cudagraph_mm_encoder": true}'
+VLLM_CUDAGRAPH_MM_ENCODER=1   # also accepts true/false
+--hf-overrides '{"encoder_cuda_graphs": true}'
+```
+
+The effective graph flag is written back to both `compilation_config` and
+the SpeechLM hf config. vLLM compiles `perception.encoder` blocks itself
+(the plugin `encoder_compile` flag is an input only) after forcing
+`FORCE_USE_FLEX_ATTENTION` on NeMo's `_flex_attention_compiled` /
+`_get_flex_attention` so inductor cannot pick flex-decoding for inputs
+shorter than 128 encoder frames (10.24 s). The leftover
+`_use_flex_decoding` `Q < 128` guard is short-circuited so crossing
+128 frames does not recompile. Layer compile and graph capture are
+deferred until after KV allocation; a post-KV graph warmup then
+captures every `(batch, frame-bucket)` (under BI: batch 1 × buckets
+up to the audio cap) using `n_feat` from the perception preprocessor
+/ encoder (`features` / `feat_in`, 128 mels here), then long-audio
+window graphs (3-window dummy plus window-count / last-width
+variants). Compile-only skips dummy-audio warmup. Warmup time is
+logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped
+module (`model.unwrap()` / `.runnable`) because
+`CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.
+Capture of a missing bucket after warmup is still lazy. Under
+`VLLM_BATCH_INVARIANT=1` the default batch grid is `(1,)` and the
+replay path is a function of each item's valid length.
+
+```bash
+VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \
+vllm serve <nemotron-3.5-transcribe-bf16> \
+  --dtype bfloat16 \
+  --compilation-config '{"compile_mm_encoder": true, "cudagraph_mm_encoder": true}' \
+  --mamba-backend triton \
+  --no-enable-prefix-caching
+```
 
 ## Troubleshooting
 

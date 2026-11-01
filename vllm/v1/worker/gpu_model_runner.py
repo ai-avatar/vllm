@@ -5118,6 +5118,14 @@ class GPUModelRunner(
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 
+                from vllm.compilation.mm_encoder import (
+                    maybe_compile_speech_mm_encoder,
+                )
+
+                maybe_compile_speech_mm_encoder(
+                    self.model, self.vllm_config, defer=True
+                )
+
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
                 # actual MoE language model but don't implement
@@ -7121,6 +7129,11 @@ class GPUModelRunner(
             kv_transfer_group = get_kv_transfer_group()
             kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+
+        if not is_profiling:
+            from vllm.compilation.mm_encoder import enable_speech_encoder_after_kv
+
+            enable_speech_encoder_after_kv(self.model)
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """Add encoder-only layers to the KV cache config."""

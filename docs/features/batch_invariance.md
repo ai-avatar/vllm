@@ -172,7 +172,18 @@ in the decode or prefill batch.
 - **Audio / multimodal encoder.** Each encoder item is encoded alone in both
   the V1 `GPUModelRunner` and the V2 `EncoderRunner`, so the NeMo plugin
   cannot pad several clips into one GEMM. Production nemotron-api uses
-  `VLLM_USE_V2_MODEL_RUNNER=0`.
+  `VLLM_USE_V2_MODEL_RUNNER=0`. Optional
+  `compile_mm_encoder` / `VLLM_COMPILE_MM_ENCODER=1` compiles
+  `perception.encoder` blocks with dynamic shapes. Flex stays in that
+  graph with `FORCE_USE_FLEX_ATTENTION` so inductor cannot pick
+  flex-decoding for clips shorter than 128 encoder frames. Encoder CUDA
+  graphs (`cudagraph_mm_encoder`, `VLLM_CUDAGRAPH_MM_ENCODER`, or
+  `encoder_cuda_graphs`) are equivalent; they stay off unless any of
+  those three is set. Under BI the default graph batch grid is `(1,)`,
+  compile and capture are deferred until after KV allocation, a post-KV
+  graph warmup captures batch-1 frame buckets and long-audio window
+  graphs (n_feat from the preprocessor / encoder), and the path is a
+  function of each item's valid length.
 
 ### What you must disable (explicit errors, not silent)
 

@@ -1467,6 +1467,10 @@ class VllmConfig:
                 "disable one of them."
             )
 
+        from vllm.compilation.mm_encoder import sync_mm_encoder_compile_flags
+
+        sync_mm_encoder_compile_flags(self)
+
         self._verify_sampling_replay_config()
         self._verify_trace_replay_config()
 

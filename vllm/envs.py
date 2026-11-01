@@ -92,6 +92,8 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_COMPILE_MM_ENCODER: bool = False
+    VLLM_CUDAGRAPH_MM_ENCODER: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -359,6 +361,22 @@ def maybe_convert_bool(value: str | None) -> bool | None:
     if value is None:
         return None
     return bool(int(value))
+
+
+def parse_env_bool(name: str, default: str = "0") -> bool:
+    """Parse a boolean env var. Accepts 0/1 and true/false (any case)."""
+    raw = os.getenv(name, default)
+    if raw is None:
+        return False
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off", ""):
+        return False
+    raise ValueError(
+        f"{name} must be 0/1 or true/false, got {raw!r}. "
+        f"Example: {name}=1 or {name}=true."
+    )
 
 
 def maybe_convert_json_str_or_file(value: str | None) -> dict[str, Any] | None:
@@ -634,6 +652,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Opt-in torch.compile of multimodal / speech encoders. Alias for
+    # compilation_config.compile_mm_encoder (default off).
+    "VLLM_COMPILE_MM_ENCODER": lambda: parse_env_bool("VLLM_COMPILE_MM_ENCODER"),
+    # Opt-in CUDA graphs for multimodal encoders. Alias for
+    # compilation_config.cudagraph_mm_encoder (default off). SpeechLM
+    # graphs are captured by the NeMo plugin's EncoderGraphRunner.
+    "VLLM_CUDAGRAPH_MM_ENCODER": lambda: parse_env_bool("VLLM_CUDAGRAPH_MM_ENCODER"),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),
