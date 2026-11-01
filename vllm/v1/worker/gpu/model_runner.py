@@ -807,6 +807,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.model, self.vllm_config, kv_cache_config
                 )
 
+            from vllm.compilation.mm_encoder import (
+                enable_speech_encoder_graph_capture,
+            )
+
+            enable_speech_encoder_graph_capture(self.model)
+
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
         self.kv_block_zeroer = KVBlockZeroer(

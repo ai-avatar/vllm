@@ -7128,6 +7128,13 @@ class GPUModelRunner(
             kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
+        if not is_profiling:
+            from vllm.compilation.mm_encoder import (
+                enable_speech_encoder_graph_capture,
+            )
+
+            enable_speech_encoder_graph_capture(self.model)
+
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """Add encoder-only layers to the KV cache config."""
         block_size = self.vllm_config.cache_config.block_size

@@ -526,8 +526,10 @@ class CompilationConfig:
     ``@support_torch_compile(enable_if=should_torch_compile_mm_encoder)``
     (Qwen2.5-VL, mLLaMA4, …) compile through that decorator. NeMo SpeechLM /
     Nemotron Transcribe compiles ``perception.encoder`` blocks after load
-    with dynamic shapes (eager backend under ``VLLM_BATCH_INVARIANT``).
-    The plugin also reads hf-overrides ``encoder_compile``.
+    with dynamic shapes. ``flex_attention`` is kept outside the compiled
+    region so inductor cannot pick flex-decoding for short audio.
+    vLLM owns that compile; the plugin hf-override ``encoder_compile``
+    is an input only.
     """
 
     # Vision encoder CUDA graph
@@ -539,8 +541,10 @@ class CompilationConfig:
     For NeMo SpeechLM this is equivalent to ``VLLM_CUDAGRAPH_MM_ENCODER=1``
     and hf ``encoder_cuda_graphs``; any of the three enables the plugin's
     ``EncoderGraphRunner``. The effective value is written back to both
-    configs. vLLM's vision ``EncoderCudaGraphManager`` is used only when
-    the model implements ``SupportsEncoderCudaGraph``.
+    configs. Capture is deferred until after KV allocation and is lazy
+    per (batch, bucket). Under ``VLLM_BATCH_INVARIANT`` the default batch
+    grid is ``(1,)``. vLLM's vision ``EncoderCudaGraphManager`` is used
+    only when the model implements ``SupportsEncoderCudaGraph``.
     """
 
     encoder_cudagraph_token_budgets: list[int] = field(default_factory=list)

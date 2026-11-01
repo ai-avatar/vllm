@@ -9,12 +9,26 @@ perception encoder is built outside that decorator. This module compiles
 ``EncoderGraphRunner``) with dynamic shapes so variable audio lengths do
 not re-specialize, and it maps the official compilation flags onto the
 plugin's ``encoder_compile`` / ``encoder_cuda_graphs`` hf-overrides.
+
+Inductor must not trace ``flex_attention`` inside those blocks: its
+flex-decoding kernel (``Q`` length < 128 frames) is wrong for the
+encoder's rel-pos ``score_mod`` and padding ``block_mask``, and dynamo's
+eager backend captures the HOP as dense math. ``flex_attention`` keeps
+its own compiled kernel via a graph break. vLLM owns layer compile so
+the plugin cannot inductor-compile first under graphs.
+
+Speech encoder CUDA graphs are captured lazily after KV allocation, with
+batch sizes ``(1,)`` under ``VLLM_BATCH_INVARIANT``. The replay path is a
+function of each item's valid length, not the padded tensor width.
 """
 
 from __future__ import annotations
 
+import contextlib
+import sys
 from typing import TYPE_CHECKING, Any
 
+import torch
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -26,9 +40,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _COMPILED_ATTR = "_vllm_mm_encoder_compiled"
+_FLEX_ISOLATED_ATTR = "_vllm_speech_encoder_flex_isolated"
+_RUNNER_PATCH_ATTR = "_vllm_speech_graph_patched"
+_DYNAMO_CONFIGURED = False
 
 _NEMOTRON_SPEECH_ARCH_MARKERS = ("NeMoSpeechLM",)
 _NEMOTRON_SPEECH_MODEL_TYPES = ("nemo_speechlm",)
+
+# Windowed Sortformer / long-audio forwards hit more shape classes than
+# dynamo's default ``recompile_limit`` (8). Past the limit, compiled
+# blocks silently run eager code.
+_SPEECH_ENCODER_RECOMPILE_LIMIT = 64
+# A100 80GB + ~63GB weights: a 16-row grid left ~1.1 GiB for KV.
+_MAX_ENCODER_GRAPH_BATCH = 8
 
 
 def is_nemo_speechlm_config(hf_config: object | None) -> bool:
@@ -45,6 +69,31 @@ def is_nemo_speechlm_config(hf_config: object | None) -> bool:
     )
 
 
+def default_speech_encoder_graph_batch_sizes(
+    vllm_config: object | None = None,
+) -> tuple[int, ...]:
+    """Graph batch grid: ``(1,)`` under BI, otherwise powers of two.
+
+    Sized from ``max_num_seqs`` and capped so capture is not counted as
+    peak activation next to the 30B weights.
+    """
+    if envs.VLLM_BATCH_INVARIANT:
+        return (1,)
+    max_seqs = _MAX_ENCODER_GRAPH_BATCH
+    if vllm_config is not None:
+        sched = getattr(vllm_config, "scheduler_config", None)
+        if sched is not None:
+            raw = getattr(sched, "max_num_seqs", None)
+            if raw:
+                max_seqs = min(int(raw), _MAX_ENCODER_GRAPH_BATCH)
+    sizes: list[int] = []
+    n = 1
+    while n <= max(1, max_seqs):
+        sizes.append(n)
+        n *= 2
+    return tuple(sizes)
+
+
 def sync_mm_encoder_compile_flags(vllm_config: VllmConfig) -> None:
     """Align compilation_config, env vars, and NeMo Speech hf-overrides.
 
@@ -56,9 +105,11 @@ def sync_mm_encoder_compile_flags(vllm_config: VllmConfig) -> None:
     * hf-overrides ``encoder_compile`` / ``encoder_cuda_graphs``
 
     All three graph sources are equivalent, including under
-    ``VLLM_BATCH_INVARIANT``. The effective value is written back to both
-    ``compilation_config.cudagraph_mm_encoder`` and (for SpeechLM)
-    ``hf_config.encoder_cuda_graphs`` so they match what will run.
+    ``VLLM_BATCH_INVARIANT``. The effective graph value is written back
+    to both ``compilation_config.cudagraph_mm_encoder`` and (for
+    SpeechLM) ``hf_config.encoder_cuda_graphs``. Layer compile is owned
+    by vLLM, so ``hf_config.encoder_compile`` is cleared and the plugin
+    must not ``compile_layers`` itself.
     """
     compilation = vllm_config.compilation_config
     if envs.VLLM_COMPILE_MM_ENCODER:
@@ -80,31 +131,100 @@ def sync_mm_encoder_compile_flags(vllm_config: VllmConfig) -> None:
     if not is_nemo_speechlm_config(hf_config):
         return
 
-    if compilation.compile_mm_encoder:
-        hf_config.encoder_compile = True
+    # Plugin EncoderGraphRunner(compile_layers=True) inductor-compiles
+    # before flex_attention is isolated and ignores this module's compile
+    # path. vLLM compiles the same blocks after load instead.
+    hf_config.encoder_compile = False
 
     want_graphs = bool(compilation.cudagraph_mm_encoder)
     compilation.cudagraph_mm_encoder = want_graphs
     hf_config.encoder_cuda_graphs = want_graphs
     if want_graphs:
+        if getattr(hf_config, "encoder_cuda_graph_batch_sizes", None) is None:
+            hf_config.encoder_cuda_graph_batch_sizes = list(
+                default_speech_encoder_graph_batch_sizes(vllm_config)
+            )
         logger.warning_once(
             "Speech encoder CUDA graphs pad to length buckets and mask "
-            "by length. VLLM_BATCH_INVARIANT still encodes one item at a "
-            "time. Confirm embeddings vs eager if you enable graphs."
+            "by length. Capture is deferred until after KV allocation "
+            "and is lazy per (batch, bucket). Under "
+            "VLLM_BATCH_INVARIANT the default batch grid is (1,) and "
+            "the path is a function of each item's valid length."
         )
+
+
+def isolate_flex_attention_from_compile() -> bool:
+    """Keep ``flex_attention`` outside compiled encoder regions.
+
+    Inductor's flex-decoding path (``128 <= Q`` is false, i.e. fewer
+    than 128 encoder frames / 10.24 s) is wrong for this block's
+    rel-pos ``score_mod`` and padding ``block_mask``. Dynamo
+    ``backend="eager"`` instead captures the HOP and runs dense math.
+    Graph-breaking leaves ``flex_attention`` on its own compiled
+    kernel.
+
+    Returns:
+        True when the op was marked, or already isolated.
+
+    """
+    try:
+        import torch.nn.attention.flex_attention as flex_mod
+    except ImportError:
+        return False
+    fn = getattr(flex_mod, "flex_attention", None)
+    if fn is None:
+        return False
+    if getattr(fn, _FLEX_ISOLATED_ATTR, False):
+        return True
+    # recursive=False: graph-break at the call, but let flex_attention
+    # keep its own compiled kernel. recursive=True would force dense math.
+    isolated = torch.compiler.disable(fn, recursive=False)
+    setattr(isolated, _FLEX_ISOLATED_ATTR, True)
+    flex_mod.flex_attention = isolated  # type: ignore[attr-defined]
+
+    for module in list(sys.modules.values()):
+        if module is None:
+            continue
+        try:
+            if getattr(module, "flex_attention", None) is fn:
+                module.flex_attention = isolated  # type: ignore[attr-defined]
+        except Exception:
+            continue
+    return True
+
+
+def configure_speech_encoder_dynamo() -> None:
+    """Raise dynamo recompile limits for variable encoder window shapes."""
+    global _DYNAMO_CONFIGURED
+    if _DYNAMO_CONFIGURED:
+        return
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is None or not hasattr(dynamo, "config"):
+        return
+    config = dynamo.config
+    for name in (
+        "recompile_limit",
+        "cache_size_limit",
+        "accumulated_recompile_limit",
+    ):
+        if not hasattr(config, name):
+            continue
+        current = getattr(config, name)
+        if isinstance(current, int) and current < _SPEECH_ENCODER_RECOMPILE_LIMIT:
+            setattr(config, name, _SPEECH_ENCODER_RECOMPILE_LIMIT)
+    _DYNAMO_CONFIGURED = True
 
 
 def speech_encoder_layer_compile_kwargs() -> dict[str, Any]:
     """Kwargs for ``nn.Module.compile`` on speech-encoder blocks.
 
-    Under ``VLLM_BATCH_INVARIANT``, use the eager backend. Inductor GEMM
-    templates emit their own Triton mm and skip the ``aten::mm`` /
-    ``aten::addmm`` library impls that pin SM80 batch-invariant matmul.
+    Always inductor + dynamic shapes. ``flex_attention`` is isolated
+    first so inductor compiles LayerNorm / Linear / residual only and
+    cannot pick flex-decoding for short audio. Do not use
+    ``backend="eager"``: dynamo then captures the flex HOP as dense
+    math (~5× slower).
     """
-    kwargs: dict[str, Any] = {"dynamic": True}
-    if envs.VLLM_BATCH_INVARIANT:
-        kwargs["backend"] = "eager"
-    return kwargs
+    return {"dynamic": True}
 
 
 def collect_speech_encoder_layers(model: nn.Module) -> list[nn.Module]:
@@ -144,24 +264,260 @@ def collect_speech_encoder_layers(model: nn.Module) -> list[nn.Module]:
     return layers
 
 
+def _module_floating_dtype(module: nn.Module) -> torch.dtype | None:
+    for param in module.parameters():
+        if param.is_floating_point():
+            return param.dtype
+    return None
+
+
+def _pin_default_dtype(dtype: torch.dtype | None):
+    """Pin ``default_dtype`` so dynamo does not recompile on GLOBAL_STATE."""
+    if dtype is None or not dtype.is_floating_point:
+        return contextlib.nullcontext()
+
+    class _Pin:
+        def __enter__(self):
+            self.prev = torch.get_default_dtype()
+            if self.prev != dtype:
+                torch.set_default_dtype(dtype)
+            return self
+
+        def __exit__(self, *exc):
+            if torch.get_default_dtype() != self.prev:
+                torch.set_default_dtype(self.prev)
+            return False
+
+    return _Pin()
+
+
+def _crop_to_valid_audio(
+    audio_signal: torch.Tensor, audio_lengths: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Crop waveforms to the longest valid sample so path = f(item)."""
+    if not isinstance(audio_signal, torch.Tensor):
+        return audio_signal, audio_lengths
+    if not isinstance(audio_lengths, torch.Tensor) or audio_lengths.numel() == 0:
+        return audio_signal, audio_lengths
+    valid = int(audio_lengths.max().item())
+    if valid >= 0 and audio_signal.shape[-1] > valid:
+        audio_signal = audio_signal[..., :valid]
+    return audio_signal, audio_lengths
+
+
+def _crop_processed(
+    processed: torch.Tensor, processed_len: torch.Tensor
+) -> torch.Tensor:
+    """Crop encoder features to the longest valid frame."""
+    if not isinstance(processed, torch.Tensor) or processed.ndim < 3:
+        return processed
+    if not isinstance(processed_len, torch.Tensor) or processed_len.numel() == 0:
+        return processed
+    valid = int(processed_len.max().item())
+    if 0 < valid < processed.shape[2]:
+        return processed[:, :, :valid]
+    return processed
+
+
+def _call_graph_runner_per_item(
+    call: Any,
+    audio_signal: torch.Tensor,
+    audio_lengths: torch.Tensor,
+    return_ctc_timestamp_inputs: bool,
+) -> Any:
+    """Encode each row alone so the graph/eager path cannot see mates."""
+    outs: list[Any] = []
+    for i in range(audio_signal.shape[0]):
+        row, length = _crop_to_valid_audio(
+            audio_signal[i : i + 1], audio_lengths[i : i + 1]
+        )
+        result = call(
+            row,
+            length,
+            return_ctc_timestamp_inputs,
+        )
+        if result is None:
+            return None
+        if return_ctc_timestamp_inputs:
+            return None
+        embs = result[0] if isinstance(result, tuple) else result
+        outs.extend(embs if isinstance(embs, list) else [embs])
+    return outs
+
+
+def _capture_one_graph(
+    runner: Any, rows: int, frames: int, n_feat: int, dtype: torch.dtype
+) -> None:
+    configure_speech_encoder_dynamo()
+    with _pin_default_dtype(dtype if dtype.is_floating_point else None):
+        runner._capture(rows, frames, n_feat, dtype)
+
+
+def configure_speech_encoder_graphs(
+    model: nn.Module, vllm_config: VllmConfig | None = None
+) -> bool:
+    """Patch the plugin graph runner: defer, lazy capture, item-pure path.
+
+    Safe on dummy objects that are not an ``EncoderGraphRunner``.
+    Returns True when the runner was patched.
+    """
+    runner = getattr(model, "_encoder_graphs", None)
+    if runner is None or getattr(runner, _RUNNER_PATCH_ATTR, False):
+        return False
+    required = (
+        "_capture_or_disable",
+        "_call_short",
+        "_capture_all",
+        "_capture",
+        "_frame_bucket",
+        "_split",
+        "graphs",
+    )
+    if any(not hasattr(runner, name) for name in required):
+        return False
+
+    sizes = default_speech_encoder_graph_batch_sizes(vllm_config)
+    current = tuple(int(b) for b in getattr(runner, "batch_sizes", ()) or ())
+    hf_config = None
+    if vllm_config is not None and getattr(vllm_config, "model_config", None):
+        hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    user_sizes = getattr(hf_config, "encoder_cuda_graph_batch_sizes", None)
+    if user_sizes is None and current and current != sizes:
+        runner.batch_sizes = list(sizes)
+        if hasattr(runner, "max_rows_x_frames") and hasattr(runner, "window"):
+            runner.max_rows_x_frames = sizes[-1] * int(runner.window)
+
+    runner._vllm_allow_capture = False
+    orig_call_short = runner._call_short
+    orig_call_long = getattr(runner, "_call_long", None)
+    orig_cls_call = type(runner).__call__
+
+    def capture_or_disable(n_feat: int, dtype: torch.dtype) -> bool:
+        if not getattr(runner, "_vllm_allow_capture", False):
+            return False
+        if getattr(runner, "pool", None) is None:
+            with contextlib.suppress(Exception):
+                runner.pool = torch.cuda.graph_pool_handle()
+        # Do not call _capture_all: capture the used (batch, bucket) later.
+        return True
+
+    def call_short(
+        processed: torch.Tensor,
+        processed_len: torch.Tensor,
+        return_ctc_timestamp_inputs: bool,
+    ):
+        processed = _crop_processed(processed, processed_len)
+        frames = processed.shape[2]
+        bucket = runner._frame_bucket(frames)
+        n_feat = processed.shape[1]
+        for size in runner._split(processed.shape[0], bucket):
+            if (size, bucket) not in runner.graphs:
+                if not getattr(runner, "_vllm_allow_capture", False):
+                    return None
+                try:
+                    _capture_one_graph(runner, size, bucket, n_feat, processed.dtype)
+                except Exception as exc:
+                    logger.warning(
+                        "Speech encoder CUDA graph capture failed for "
+                        "%d rows x %d frames; encoding eagerly: %s",
+                        size,
+                        bucket,
+                        exc,
+                    )
+                    runner.graphs.clear()
+                    runner.enabled = False
+                    return None
+        return orig_call_short(processed, processed_len, return_ctc_timestamp_inputs)
+
+    def call_long(
+        processed: torch.Tensor,
+        processed_len: torch.Tensor,
+        return_ctc_timestamp_inputs: bool,
+    ):
+        processed = _crop_processed(processed, processed_len)
+        assert orig_call_long is not None
+        return orig_call_long(processed, processed_len, return_ctc_timestamp_inputs)
+
+    cls = type(runner)
+    if not getattr(cls, "_vllm_speech_graph_call_wrapped", False):
+
+        def cls_call(
+            self,
+            audio_signal: torch.Tensor,
+            audio_lengths: torch.Tensor,
+            return_ctc_timestamp_inputs: bool = False,
+        ):
+            if not getattr(self, _RUNNER_PATCH_ATTR, False):
+                return orig_cls_call(
+                    self, audio_signal, audio_lengths, return_ctc_timestamp_inputs
+                )
+            if not getattr(self, "enabled", True):
+                return None
+            if not self.graphs and not getattr(self, "_vllm_allow_capture", False):
+                return None
+            audio_signal, audio_lengths = _crop_to_valid_audio(
+                audio_signal, audio_lengths
+            )
+            if (
+                envs.VLLM_BATCH_INVARIANT
+                and isinstance(audio_signal, torch.Tensor)
+                and audio_signal.shape[0] > 1
+                and not return_ctc_timestamp_inputs
+            ):
+                return _call_graph_runner_per_item(
+                    lambda audio, length, ctc: orig_cls_call(self, audio, length, ctc),
+                    audio_signal,
+                    audio_lengths,
+                    return_ctc_timestamp_inputs,
+                )
+            return orig_cls_call(
+                self, audio_signal, audio_lengths, return_ctc_timestamp_inputs
+            )
+
+        cls.__call__ = cls_call
+        cls._vllm_speech_graph_call_wrapped = True
+
+    runner._capture_or_disable = capture_or_disable
+    runner._call_short = call_short
+    if orig_call_long is not None:
+        runner._call_long = call_long
+    setattr(runner, _RUNNER_PATCH_ATTR, True)
+    logger.info(
+        "Speech encoder CUDA graphs will capture lazily after KV "
+        "allocation (batch_sizes=%s).",
+        list(getattr(runner, "batch_sizes", sizes)),
+    )
+    return True
+
+
+def enable_speech_encoder_graph_capture(model: nn.Module | None) -> None:
+    """Allow lazy graph capture now that KV memory is reserved."""
+    if model is None:
+        return
+    runner = getattr(model, "_encoder_graphs", None)
+    if runner is None or not getattr(runner, _RUNNER_PATCH_ATTR, False):
+        return
+    runner._vllm_allow_capture = True
+    logger.info_once("Speech encoder CUDA graphs enabled for lazy per-bucket capture.")
+
+
 def maybe_compile_speech_mm_encoder(model: nn.Module, vllm_config: VllmConfig) -> int:
     """Compile speech-encoder layers when ``compile_mm_encoder`` is on.
 
-    Returns the number of layers compiled. No-op when the flag is off, the
-    plugin already built ``EncoderGraphRunner`` (it compiles those layers
-    itself), or ``perception.encoder`` has no layer lists.
+    Always prepares graph-runner patches (defer / lazy / item-pure path)
+    when the plugin built ``EncoderGraphRunner``. Layer compile is not
+    deferred to the plugin: vLLM compiles the same blocks after
+    isolating ``flex_attention``, including when graphs are on.
 
-    CUDA graphs are not captured here. Vision models keep using
-    ``EncoderCudaGraphManager`` + ``SupportsEncoderCudaGraph``. SpeechLM
-    graphs stay in the plugin's ``EncoderGraphRunner``.
+    Returns the number of layers compiled.
     """
-    if not vllm_config.compilation_config.compile_mm_encoder:
-        return 0
-    if getattr(model, "_encoder_graphs", None) is not None:
-        logger.info(
-            "Speech encoder CUDA graphs are active; layer compile is owned "
-            "by EncoderGraphRunner."
-        )
+    configure_speech_encoder_graphs(model, vllm_config)
+    want_compile = bool(vllm_config.compilation_config.compile_mm_encoder)
+    if want_compile or getattr(model, "_encoder_graphs", None) is not None:
+        isolate_flex_attention_from_compile()
+        configure_speech_encoder_dynamo()
+
+    if not want_compile:
         return 0
 
     layers = collect_speech_encoder_layers(model)
@@ -170,27 +526,28 @@ def maybe_compile_speech_mm_encoder(model: nn.Module, vllm_config: VllmConfig) -
 
     compile_kwargs = speech_encoder_layer_compile_kwargs()
     compiled = 0
-    for layer in layers:
-        if getattr(layer, _COMPILED_ATTR, False):
-            continue
-        try:
-            layer.compile(**compile_kwargs)
-        except Exception as exc:
-            logger.warning(
-                "Failed to compile %s; encoder stays eager for that block: %s",
-                type(layer).__name__,
-                exc,
-            )
-            continue
-        setattr(layer, _COMPILED_ATTR, True)
-        compiled += 1
+    dtype = _module_floating_dtype(model)
+    with _pin_default_dtype(dtype):
+        for layer in layers:
+            if getattr(layer, _COMPILED_ATTR, False):
+                continue
+            try:
+                layer.compile(**compile_kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to compile %s; encoder stays eager for that block: %s",
+                    type(layer).__name__,
+                    exc,
+                )
+                continue
+            setattr(layer, _COMPILED_ATTR, True)
+            compiled += 1
 
     if compiled:
-        backend = compile_kwargs.get("backend", "inductor")
         logger.info(
             "Compiled %d speech-encoder layer(s) with dynamic shapes "
-            "(compile_mm_encoder=True, backend=%s).",
+            "(compile_mm_encoder=True, backend=inductor, flex_attention "
+            "isolated).",
             compiled,
-            backend,
         )
     return compiled
