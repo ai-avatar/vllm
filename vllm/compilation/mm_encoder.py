@@ -104,6 +104,8 @@ _MASK_VALID_LEN: int | None = None
 # close over these tensors (not Python ints) or dynamo guards the length.
 # Cache key is (bucket, B, H) only: structure is always a full bucket so
 # a short valid cannot mark tail blocks empty for a later longer valid.
+# Aligner traffic uses a ``:aligner`` device-key suffix so fill_ / cache
+# writes cannot mutate the serving tensors compiled encodes replay.
 _MASK_STATE: dict[str, dict[str, Any]] = {}
 # getattr on CUDAGraphWrapper forwards to .runnable; delattr does not.
 # Keep a side table so pending layers survive wrap/unwrap either way.
@@ -430,6 +432,7 @@ _ENCODER_RECOMPILE_SKIP_FUNCS = frozenset(
         "_recompile_watch_context",
         "_recompile_code_is_encoder",
         "_recompile_filename_is_encoder",
+        "_recompile_target_code",
         "_install_speech_encoder_recompile_watch",
     }
 )
@@ -440,30 +443,34 @@ def _recompile_filename_is_encoder(filename: str) -> bool:
     return any(marker in path for marker in _ENCODER_RECOMPILE_FILE_MARKERS)
 
 
-def _recompile_code_is_encoder() -> bool:
-    """True only when the compiling / calling code is the speech encoder.
+def _recompile_target_code() -> Any:
+    """The ``CodeType`` dynamo is compiling (``convert_frame._compile``).
 
-    The dynamo user-context hook runs for every process recompile, including
-    LM CUDA-graph capture (``activation.forward_native``, ``grouped_topk``).
-    Those must not inherit the last encoder path/bucket.
+    The user-context hook is invoked from every process compile, including
+    LM CUDA-graph capture. Only that frame's ``code`` local is the function
+    being compiled; walking the rest of the stack (or leftover encoder
+    path/bucket) false-positives ``activation.forward_native`` /
+    ``grouped_topk``.
     """
     frame: Any = sys._getframe()
     while frame is not None:
         code = frame.f_code
-        if code.co_name not in _ENCODER_RECOMPILE_SKIP_FUNCS:
-            if _recompile_filename_is_encoder(code.co_filename):
-                return True
-            for key in ("code", "orig_code", "frame"):
-                obj = frame.f_locals.get(key)
-                filename = getattr(obj, "co_filename", None) or getattr(
-                    getattr(obj, "f_code", None), "co_filename", None
-                )
-                if isinstance(filename, str) and _recompile_filename_is_encoder(
-                    filename
-                ):
-                    return True
+        filename = code.co_filename.replace("\\", "/")
+        if code.co_name == "_compile" and "convert_frame" in filename:
+            obj = frame.f_locals.get("code")
+            if type(obj) is type(code):
+                return obj
+            return None
         frame = frame.f_back
-    return False
+    return None
+
+
+def _recompile_code_is_encoder() -> bool:
+    """True only when the compiled code object's file is the speech encoder."""
+    code = _recompile_target_code()
+    if code is None:
+        return False
+    return _recompile_filename_is_encoder(code.co_filename)
 
 
 def _recompile_watch_context() -> str:
@@ -606,15 +613,24 @@ def speech_encoder_set_mask_valid(
 
 
 def _mask_state(device: torch.device | str | None) -> dict[str, Any]:
-    """Reuse one tensor-backed mask_mod per device (no Python-int guards)."""
+    """Reuse one tensor-backed mask_mod per device (no Python-int guards).
+
+    The timestamp aligner fill_s ``valid_q`` / rebuilds BlockMasks. Keep
+    that cache on a separate key so an aligner call cannot mutate the
+    serving tensors the next compiled encode replays.
+    """
     key = _device_key(device)
+    if _ALIGNER_ACTIVE:
+        key = f"{key}:aligner"
     state = _MASK_STATE.get(key)
     if state is not None:
         return state
-    kind, _, index_s = key.partition(":")
-    dev = (
-        torch.device(kind, int(index_s or 0)) if kind != "cpu" else torch.device("cpu")
-    )
+    if device is None:
+        dev = torch.device("cpu")
+    elif isinstance(device, str):
+        dev = torch.device(device)
+    else:
+        dev = device
     # Must not be inference tensors: aligner fill_s them outside inference_mode.
     with torch.inference_mode(False):
         valid_q = torch.zeros((), device=dev, dtype=torch.int32)
@@ -829,9 +845,14 @@ def _should_use_eager_flex(*tensors: Any) -> bool:
 @contextlib.contextmanager
 def _aligner_runtime():
     """Match serving dispatch keys: inference, no grad, eager-flex flag."""
-    global _ALIGNER_ACTIVE
+    global _ALIGNER_ACTIVE, _MASK_VALID_LEN, _LAST_PROCESSED_LEN
     prev = _ALIGNER_ACTIVE
+    prev_valid = _MASK_VALID_LEN
+    prev_processed = _LAST_PROCESSED_LEN
     _ALIGNER_ACTIVE = True
+    # Do not let a prior serving valid clip the aligner's own T.
+    _MASK_VALID_LEN = None
+    _LAST_PROCESSED_LEN = None
     already = _is_inference_mode()
     try:
         if already:
@@ -841,6 +862,8 @@ def _aligner_runtime():
             yield
     finally:
         _ALIGNER_ACTIVE = prev
+        _MASK_VALID_LEN = prev_valid
+        _LAST_PROCESSED_LEN = prev_processed
 
 
 @contextlib.contextmanager
@@ -927,47 +950,57 @@ def _call_flex_with_static_bucket(
     kwargs["kernel_options"] = opts
     if not isinstance(q, torch.Tensor) or q.ndim < 3:
         return fn(*args_list, **kwargs)
-    q = _detach_flex_tensor(q)
-    k = _detach_flex_tensor(k)
-    v = _detach_flex_tensor(v)
-    # Transpose from (B, T, H, D) leaves contig=False; dynamo guards
-    # that stride unless we materialize before the compiled flex call.
-    if isinstance(q, torch.Tensor) and not q.is_contiguous():
+
+    def _pad_mask_and_call(
+        q: Any, k: Any, v: Any, args_list: list[Any], kwargs: dict[str, Any]
+    ) -> Any:
+        q = _detach_flex_tensor(q)
+        k = _detach_flex_tensor(k)
+        v = _detach_flex_tensor(v)
+        # Transpose from (B, T, H, D) leaves contig=False; dynamo guards
+        # that stride unless we materialize before the compiled flex call.
+        if isinstance(q, torch.Tensor) and not q.is_contiguous():
+            q = q.contiguous()
+        if isinstance(k, torch.Tensor) and not k.is_contiguous():
+            k = k.contiguous()
+        if isinstance(v, torch.Tensor) and not v.is_contiguous():
+            v = v.contiguous()
+        orig_t = int(q.shape[-2])
+        # Never grow to an incoming mask's seq_lengths (aligner 4000-frame leak).
+        bucket = speech_encoder_flex_bucket(orig_t)
+        valid = _resolve_flex_valid(orig_t, bucket)
+        if bucket > orig_t:
+            q = _pad_flex_qkv(q, bucket)
+            if isinstance(k, torch.Tensor):
+                k = _pad_flex_qkv(k, bucket)
+            if isinstance(v, torch.Tensor):
+                v = _pad_flex_qkv(v, bucket)
         q = q.contiguous()
-    if isinstance(k, torch.Tensor) and not k.is_contiguous():
-        k = k.contiguous()
-    if isinstance(v, torch.Tensor) and not v.is_contiguous():
-        v = v.contiguous()
-    orig_t = int(q.shape[-2])
-    # Never grow to an incoming mask's seq_lengths (aligner 4000-frame leak).
-    bucket = speech_encoder_flex_bucket(orig_t)
-    valid = _resolve_flex_valid(orig_t, bucket)
-    if bucket > orig_t:
-        q = _pad_flex_qkv(q, bucket)
         if isinstance(k, torch.Tensor):
-            k = _pad_flex_qkv(k, bucket)
+            k = k.contiguous()
         if isinstance(v, torch.Tensor):
-            v = _pad_flex_qkv(v, bucket)
-    q = q.contiguous()
-    if isinstance(k, torch.Tensor):
-        k = k.contiguous()
-    if isinstance(v, torch.Tensor):
-        v = v.contiguous()
-    new_mask = _cached_block_mask(bucket, valid, q)
-    if new_mask is not None:
-        kwargs["block_mask"] = new_mask
-    _record_flex_input(q, kwargs.get("block_mask"), orig_t=orig_t, bucket=bucket)
-    _set_flex_qkv(args_list, kwargs, q, k, v)
-    dtype = q.dtype if isinstance(q, torch.Tensor) and q.is_floating_point() else None
-    with _pin_default_dtype(dtype):
-        if use_eager:
-            with _aligner_runtime(), _force_eager_compute():
+            v = v.contiguous()
+        new_mask = _cached_block_mask(bucket, valid, q)
+        if new_mask is not None:
+            kwargs["block_mask"] = new_mask
+        _record_flex_input(q, kwargs.get("block_mask"), orig_t=orig_t, bucket=bucket)
+        _set_flex_qkv(args_list, kwargs, q, k, v)
+        dtype = (
+            q.dtype if isinstance(q, torch.Tensor) and q.is_floating_point() else None
+        )
+        with _pin_default_dtype(dtype):
+            if use_eager:
                 out = _disable_dynamo_fn(call_fn)(*args_list, **kwargs)
-        else:
-            out = call_fn(*args_list, **kwargs)
-    if bucket > orig_t:
-        return _crop_flex_output(out, orig_t)
-    return out
+            else:
+                out = call_fn(*args_list, **kwargs)
+        if bucket > orig_t:
+            return _crop_flex_output(out, orig_t)
+        return out
+
+    if use_eager:
+        with _aligner_runtime(), _force_eager_compute():
+            return _pad_mask_and_call(q, k, v, args_list, kwargs)
+    return _pad_mask_and_call(q, k, v, args_list, kwargs)
 
 
 _call_flex_with_static_bucket = _disable_dynamo_fn(_call_flex_with_static_bucket)
@@ -1576,6 +1609,26 @@ def _prime_mask_from_processed(
     speech_encoder_set_mask_valid(device, valid, valid)
 
 
+def _prime_mask_from_call_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    """Best-effort valid-length write from ``encoder.forward`` arguments."""
+    processed = kwargs.get("audio_signal", kwargs.get("processed"))
+    processed_len = kwargs.get("audio_lengths", kwargs.get("processed_len"))
+    if processed is None:
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and arg.ndim >= 2:
+                processed = arg
+                break
+    if processed_len is None:
+        for arg in args:
+            if arg is processed:
+                continue
+            if isinstance(arg, torch.Tensor) and arg.ndim <= 1:
+                processed_len = arg
+                break
+    if isinstance(processed, torch.Tensor):
+        _prime_mask_from_processed(processed, processed_len)
+
+
 def _wrap_speech_encoder_inference(model: Any) -> bool:
     """Run perception.encoder under inference_mode (aligner call site)."""
     inner = unwrap_speech_encoder_model(model) if model is not None else None
@@ -1592,6 +1645,7 @@ def _wrap_speech_encoder_inference(model: Any) -> bool:
     def wrapped(*args: Any, **kwargs: Any):
         with _encoder_dtype_runtime(), _speech_encoder_runtime():
             args, kwargs = _promote_to_inference(args, kwargs)
+            _prime_mask_from_call_args(args, kwargs)
             if _ALIGNER_ACTIVE:
                 with _force_eager_compute():
                     return _disable_dynamo_fn(orig)(*args, **kwargs)
@@ -1719,12 +1773,17 @@ def configure_speech_encoder_graphs(
     ):
         processed = _prepare_processed(processed, processed_len, runner, long=False)
         _record_encoder_path("short", processed, processed_len)
-        _prime_mask_from_processed(processed, processed_len)
-        if return_ctc_timestamp_inputs:
+        # Timestamps add a CTC aligner *after* transcription. The
+        # serving encode (inference_mode) must stay on the same
+        # compiled / graphed path as plain. Eager-route only the
+        # post-transcription aligner (not inference_mode).
+        if return_ctc_timestamp_inputs and not _is_inference_mode():
             with _aligner_runtime(), _force_eager_compute():
+                _prime_mask_from_processed(processed, processed_len)
                 return _disable_dynamo_fn(orig_call_short)(
                     processed, processed_len, return_ctc_timestamp_inputs
                 )
+        _prime_mask_from_processed(processed, processed_len)
         frames = processed.shape[2]
         bucket = runner._frame_bucket(frames)
         n_feat = processed.shape[1]
@@ -1768,13 +1827,14 @@ def configure_speech_encoder_graphs(
         with _encoder_dtype_runtime():
             processed = _prepare_processed(processed, processed_len, runner, long=True)
             _record_encoder_path("long", processed, processed_len)
-            _prime_mask_from_processed(processed, processed_len)
             assert orig_call_long is not None
-            if return_ctc_timestamp_inputs:
+            if return_ctc_timestamp_inputs and not _is_inference_mode():
                 with _aligner_runtime(), _force_eager_compute():
+                    _prime_mask_from_processed(processed, processed_len)
                     return _disable_dynamo_fn(orig_call_long)(
                         processed, processed_len, return_ctc_timestamp_inputs
                     )
+            _prime_mask_from_processed(processed, processed_len)
             return orig_call_long(processed, processed_len, return_ctc_timestamp_inputs)
 
     cls = type(runner)

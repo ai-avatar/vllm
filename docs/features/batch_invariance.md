@@ -195,7 +195,10 @@ in the decode or prefill batch.
   Warmup also runs the plugin profile dummy
   (`3 * max_frames` when that cap is 4000).
   The timestamp aligner is `torch.compiler.disable`'d (no new
-  unique_graphs). Flex
+  unique_graphs) and keeps its own BlockMask / valid-length
+  tensors so it cannot mutate the next compiled encode. A
+  timestamp request's transcription pass uses the same compiled
+  graphs as plain. Flex
   compiles with `dynamic=False`. The path is a function of each item's
   valid length. Compiled encoder / flex kernels pin inductor
   `deterministic` (and disable timing `max_autotune` /

@@ -1004,7 +1004,38 @@ def test_recompile_watch_ignores_non_encoder_code_objects():
     mm_encoder_mod._set_serving_watch(True)
     mm_encoder_mod._LAST_ENCODER_PATH = "long"
     mm_encoder_mod._LAST_FLEX_INPUT["bucket"] = 550
+    # No convert_frame._compile on the stack: never warn from context.
     assert mm_encoder_mod._recompile_watch_context() == ""
+    mm_encoder_mod._set_serving_watch(False)
+
+
+def test_recompile_watch_filters_on_compiled_code_object_only():
+    """LM capture (activation.forward_native) must not inherit encoder path."""
+    import types
+
+    def dummy():
+        return None
+
+    encoder = dummy.__code__.replace(
+        co_filename="/opt/nemo/collections/asr/modules/transformer_encoder.py"
+    )
+    lm = dummy.__code__.replace(
+        co_filename="/workspace/vllm/model_executor/layers/activation.py"
+    )
+
+    def _compile(code):
+        return mm_encoder_mod._recompile_watch_context()
+
+    compile_code = _compile.__code__.replace(
+        co_filename="/tmp/torch/_dynamo/convert_frame.py",
+        co_name="_compile",
+    )
+    fake_compile = types.FunctionType(compile_code, _compile.__globals__, "_compile")
+    mm_encoder_mod._set_serving_watch(False)
+    mm_encoder_mod._LAST_ENCODER_PATH = "long"
+    mm_encoder_mod._LAST_FLEX_INPUT["bucket"] = 550
+    assert fake_compile(lm) == ""
+    assert "bucket=550" in fake_compile(encoder)
     mm_encoder_mod._set_serving_watch(False)
 
 
@@ -1242,8 +1273,8 @@ def test_on_bucket_q_uses_processed_len_not_padded_shape():
 
     mm_encoder_mod._EAGER_FLEX = None
     wrapped = mm_encoder_mod._pad_flex_wrapper(fake_flex)
-    q = torch.randn(1, 2, 256, 8)
     with torch.inference_mode():
+        q = torch.randn(1, 2, 256, 8)
         out = wrapped(q, q, q)
     assert seen["T"] == 256
     assert seen["valid"] == 99
@@ -1309,6 +1340,80 @@ def test_timestamp_flag_enters_aligner_runtime(monkeypatch: pytest.MonkeyPatch):
     runner._call_long(processed, processed_len, True)
     assert entered == [True]
     envs.disable_envs_cache()
+
+
+def test_timestamp_flag_in_inference_mode_stays_on_graph_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Serving transcription with timestamps must not eager-route."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    envs.disable_envs_cache()
+    model = _SpeechModel()
+    runner = _FakeGraphRunner()
+    entered: list[bool] = []
+
+    orig_long = runner._call_long
+
+    def tracking_long(processed, processed_len, return_ctc_timestamp_inputs):
+        entered.append(mm_encoder_mod._ALIGNER_ACTIVE)
+        return orig_long(processed, processed_len, return_ctc_timestamp_inputs)
+
+    runner._call_long = tracking_long  # type: ignore[method-assign]
+    model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=False, graphs=True))
+    enable_speech_encoder_graph_capture(model)
+    processed = torch.zeros(1, 128, 3 * 550 + 50)
+    processed_len = torch.tensor([3 * 550 + 50])
+    with torch.inference_mode():
+        runner._call_long(processed, processed_len, True)
+        runner._call_long(processed, processed_len, False)
+    assert entered == [False, False]
+    envs.disable_envs_cache()
+
+
+def test_aligner_mask_state_is_isolated_from_serving():
+    device = torch.device("cpu")
+    mm_encoder_mod._MASK_STATE.clear()
+    mm_encoder_mod._ALIGNER_ACTIVE = False
+    serving = mm_encoder_mod._mask_state(device)
+    mm_encoder_mod._set_mask_valid_len(serving, 99, 99)
+    with mm_encoder_mod._aligner_runtime():
+        aligner = mm_encoder_mod._mask_state(device)
+        assert aligner is not serving
+        mm_encoder_mod._set_mask_valid_len(aligner, 600, 600)
+        assert int(aligner["valid_q"].item()) == 600
+        assert int(serving["valid_q"].item()) == 99
+    assert int(serving["valid_q"].item()) == 99
+    assert mm_encoder_mod._mask_state(device) is serving
+    mm_encoder_mod._MASK_STATE.clear()
+
+
+def test_aligner_between_encodes_does_not_mutate_serving_mask():
+    """An aligner prime between two encodes must leave serving valid_q intact."""
+    device = torch.device("cpu")
+    mm_encoder_mod._MASK_STATE.clear()
+    mm_encoder_mod._ALIGNER_ACTIVE = False
+    mm_encoder_mod._prime_mask_from_processed(
+        torch.zeros(1, 128, 550), torch.tensor([99])
+    )
+    serving = mm_encoder_mod._mask_state(device)
+    first_valid = int(serving["valid_q"].item())
+    assert first_valid == 99
+    prev_global = mm_encoder_mod._MASK_VALID_LEN
+    with mm_encoder_mod._aligner_runtime():
+        mm_encoder_mod._prime_mask_from_processed(
+            torch.zeros(2, 128, 600), torch.tensor([600, 600])
+        )
+        aligner = mm_encoder_mod._mask_state(device)
+        assert aligner is not serving
+        assert int(aligner["valid_q"].item()) == 600
+    assert int(serving["valid_q"].item()) == first_valid
+    assert prev_global == mm_encoder_mod._MASK_VALID_LEN
+    mm_encoder_mod._prime_mask_from_processed(
+        torch.zeros(1, 128, 550), torch.tensor([99])
+    )
+    assert int(serving["valid_q"].item()) == first_valid
+    mm_encoder_mod._MASK_STATE.clear()
 
 
 def test_long_call_pads_remainder_to_window(monkeypatch: pytest.MonkeyPatch):

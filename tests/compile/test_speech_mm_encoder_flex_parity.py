@@ -450,6 +450,67 @@ def test_aligner_like_flex_after_warmup_no_recompile_or_dense():
     envs.disable_envs_cache()
 
 
+def test_aligner_between_compiled_encodes_is_bitwise_stable():
+    """Aligner flex between two compiled encodes must not change the second."""
+    from torch._dynamo.utils import counters
+
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+    from vllm.compilation.mm_encoder import configure_speech_encoder_dynamo
+
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    import vllm.envs as envs
+
+    envs.disable_envs_cache()
+    mm_encoder_mod._INDUCTOR_PINNED = False
+    isolate_flex_attention_from_compile()
+    configure_speech_encoder_dynamo()
+    _try_create_block_mask()
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=_ENCODER_WINDOW, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._MASK_STATE.clear()
+    mm_encoder_mod._set_serving_watch(True)
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    mm_encoder_mod._EAGER_FLEX = _raw_flex
+    compiled = torch.compile(_raw_flex, dynamic=False, backend="eager")
+    wrapped = mm_encoder_mod._pad_flex_wrapper(compiled)
+
+    torch._dynamo.reset()
+    counters.clear()
+    with torch.inference_mode():
+        for frames in (256, 550, 1100, 1513):
+            q = torch.randn(1, 16, frames, 80, device=device, dtype=dtype)
+            mm_encoder_mod._begin_encoder_mask(frames)
+            wrapped(q, q.clone(), q.clone())
+    after_warmup = int(counters["stats"]["unique_graphs"])
+
+    torch.manual_seed(11)
+    probe = torch.randn(1, 16, 1513, 80, device=device, dtype=dtype)
+    with torch.inference_mode():
+        mm_encoder_mod._begin_encoder_mask(1513)
+        first = wrapped(probe, probe.clone(), probe.clone())
+    serving = mm_encoder_mod._mask_state(device)
+    serving_valid = int(serving["valid_q"].item())
+
+    assert not mm_encoder_mod._is_inference_mode()
+    for frames in _ALIGNER_FRAMES:
+        q = torch.randn(2, 16, frames, 80, device=device, dtype=dtype)
+        wrapped(q, q.clone(), q.clone())
+    assert mm_encoder_mod._mask_state(device) is serving
+    assert int(serving["valid_q"].item()) == serving_valid
+
+    with torch.inference_mode():
+        mm_encoder_mod._begin_encoder_mask(1513)
+        second = wrapped(probe, probe.clone(), probe.clone())
+    assert torch.equal(first, second)
+    assert int(counters["stats"]["unique_graphs"]) == after_warmup
+    mm_encoder_mod._set_serving_watch(False)
+    mm_encoder_mod._MASK_STATE.clear()
+    envs.disable_envs_cache()
+
+
 def test_varied_valid_lengths_match_eager_including_ami_and_short():
     """7.9 s, 121 s, and on-bucket lengths vs eager reference."""
     create_block_mask = _try_create_block_mask()

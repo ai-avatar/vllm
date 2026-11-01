@@ -122,10 +122,14 @@ layer; q/k/v are `.contiguous()` before the compiled flex call.
 Every encoder forward pins `default_dtype` to the compile-time
 model dtype so request-time `GLOBAL_STATE` cannot recompile the
 layers (warmup used to restore float32). The post-warmup recompile
-watch only fires for encoder code objects, not LM CUDA-graph
-capture.
+watch inspects only the `CodeType` dynamo is compiling
+(`convert_frame._compile`'s `code` filename), so LM CUDA-graph
+capture (`activation.forward_native`, `grouped_topk`) is silent.
 The timestamp aligner is
-`torch.compiler.disable`'d so it cannot add unique_graphs. A
+`torch.compiler.disable`'d so it cannot add unique_graphs. It uses
+an isolated BlockMask / valid-length cache; the transcription
+encode (plain or timestamps) stays on the same compiled / graphed
+path. A
 profile dummy with `window=max_frames` (e.g. 4000) does not pad a
 500-frame slice to 4000, and warmup also runs the
 `(1, n_feat, 3 * max_frames)` dummy `profile_run` still forwards.

@@ -15,7 +15,7 @@ Examples:
       --model /path/to/nemotron-3.5-transcribe-bf16 \\
       --seconds 7.9,11,121 --aligner --burst
 
-  # Offline LLM e2e (7.9 s, 121 s, ~25 min; plain + timestamp path):
+  # Offline LLM e2e (7.9 s, 121 s, ~25 min; plain→timestamps×2 order check):
   python tools/nemotron_encoder_repro.py --model /path/to/ckpt --e2e \\
       --audio /path/to/7.9s.wav,/path/to/ami_121s.wav,/path/to/25min.wav
 
@@ -339,13 +339,19 @@ def _shutdown_llm(llm) -> None:
         pass
 
 
-def _eager_encode_worker(model: str, frames: list[int], n_feat: int, out_path: str):
+def _eager_encode_worker(
+    model: str,
+    frames: list[int],
+    n_feat: int,
+    out_path: str,
+    gpu_memory_utilization: float = 0.85,
+):
     import torch
 
     from vllm.compilation import mm_encoder as mm_encoder_mod
 
     llm, inner = _load_vllm_encoder(
-        model, compile_mm=False, gpu_memory_utilization=0.35
+        model, compile_mm=False, gpu_memory_utilization=gpu_memory_utilization
     )
     if inner is None:
         with open(out_path, "w", encoding="utf-8") as fh:
@@ -368,7 +374,12 @@ def _eager_encode_worker(model: str, frames: list[int], n_feat: int, out_path: s
         json.dump({"ok": True, "outs": outs}, fh)
 
 
-def _run_eager_subprocess(model: str, frames: list[int], n_feat: int) -> dict:
+def _run_eager_subprocess(
+    model: str,
+    frames: list[int],
+    n_feat: int,
+    gpu_memory_utilization: float = 0.85,
+) -> dict:
     import subprocess
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
@@ -378,7 +389,8 @@ def _run_eager_subprocess(model: str, frames: list[int], n_feat: int) -> dict:
         "-c",
         (
             "from tools.nemotron_encoder_repro import _eager_encode_worker; "
-            f"_eager_encode_worker({model!r}, {frames!r}, {n_feat}, {out_path!r})"
+            f"_eager_encode_worker({model!r}, {frames!r}, {n_feat}, "
+            f"{out_path!r}, {gpu_memory_utilization})"
         ),
     ]
     env = os.environ.copy()
@@ -405,7 +417,9 @@ def _run_model(args: argparse.Namespace) -> int:
         frames.append(_seconds_to_frames(sec, hop))
     frames = sorted(set(int(f) for f in frames if f > 0))
     print("eager encodings in a subprocess (before compiled engine)")
-    eager = _run_eager_subprocess(args.model, frames, n_feat)
+    eager = _run_eager_subprocess(
+        args.model, frames, n_feat, args.gpu_memory_utilization
+    )
     if not eager.get("ok"):
         print(f"FAIL: eager subprocess failed: {eager.get('error')}")
         return 1
@@ -480,6 +494,23 @@ def _run_model(args: argparse.Namespace) -> int:
                 f"  FAIL recompile: unique_graphs {after_warmup} -> {_unique_graphs()}"
             )
         mm_encoder_mod._set_serving_watch(False)
+        print("compiled encode after aligner (must be bitwise-identical)")
+        for t in frames:
+            if t not in compiled_out:
+                continue
+            try:
+                with torch.inference_mode():
+                    torch.manual_seed(t)
+                    after = _first_tensor(encode(compiled_inner, t, inference=True))
+                before = _payload_to_tensor(compiled_out[t])
+                match = bool(torch.equal(before, after))
+                print(f"  T={t} after-aligner bitwise={'OK' if match else 'FAIL'}")
+                if not match:
+                    failed += 1
+            except Exception as exc:
+                failed += 1
+                print(f"  T={t} after-aligner FAIL: {exc}")
+                traceback.print_exc()
 
     print("compiled vs eager")
     for t in frames:
@@ -566,6 +597,83 @@ def _print_output_text(outputs) -> str:
     if out:
         return str(out[0].text)
     return str(first)
+
+
+def _hash_tensor(tensor) -> str:
+    import hashlib
+
+    import torch
+
+    cpu = tensor.detach().contiguous().cpu()
+    data = cpu.view(torch.uint8).reshape(-1).numpy().tobytes()
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _unwrap_llm_inner(llm):
+    engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+    for name in ("model_executor", "engine_core"):
+        obj = getattr(engine, name, None) if engine is not None else None
+        if obj is None:
+            continue
+        driver = getattr(obj, "driver_worker", None) or getattr(obj, "worker", None)
+        if driver is None:
+            continue
+        runner = getattr(driver, "model_runner", None)
+        inner = getattr(runner, "model", None) if runner is not None else None
+        if inner is not None:
+            return inner
+    return None
+
+
+def _install_embed_hash_probe(llm) -> list[str]:
+    """Hash transcription-pass encoder outputs (skip aligner-active calls)."""
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+    from vllm.compilation.mm_encoder import unwrap_speech_encoder_model
+
+    hashes: list[str] = []
+    inner = _unwrap_llm_inner(llm)
+    if inner is not None:
+        with contextlib.suppress(Exception):
+            inner = unwrap_speech_encoder_model(inner) or inner
+    if inner is None:
+        return hashes
+
+    def _record(result) -> None:
+        with contextlib.suppress(Exception):
+            hashes.append(_hash_tensor(_first_tensor(result)))
+
+    runner = getattr(inner, "_encoder_graphs", None)
+    if runner is not None:
+        for name in ("_call_short", "_call_long"):
+            orig = getattr(runner, name, None)
+            if not callable(orig):
+                continue
+
+            def make(fn):
+                def wrapped(processed, processed_len, return_ctc):
+                    serving = mm_encoder_mod._is_inference_mode()
+                    out = fn(processed, processed_len, return_ctc)
+                    if serving:
+                        _record(out)
+                    return out
+
+                return wrapped
+
+            setattr(runner, name, make(orig))
+    perception = getattr(inner, "perception", None)
+    encoder = getattr(perception, "encoder", None)
+    orig_fwd = getattr(encoder, "forward", None) if encoder is not None else None
+    if callable(orig_fwd) and runner is None:
+
+        def fwd_wrapped(*args, **kwargs):
+            serving = mm_encoder_mod._is_inference_mode()
+            out = orig_fwd(*args, **kwargs)
+            if serving:
+                _record(out)
+            return out
+
+        encoder.forward = fwd_wrapped
+    return hashes
 
 
 def _audio_placeholder_from_llm(llm) -> str:
@@ -689,10 +797,32 @@ def _e2e_one_request(llm, wave, sr: int, sampling, *, mm_kwargs=None):
         return llm.generate(prompt, sampling, mm_processor_kwargs=mm_kwargs)
 
 
+def _e2e_clip_request(llm, chunks, sr: int, *, timestamps: bool, max_tokens: int):
+    from vllm.sampling_params import SamplingParams
+
+    if timestamps:
+        sampling = SamplingParams(
+            temperature=0.0,
+            max_tokens=max_tokens,
+            extra_args={"return_ctc_timestamp_inputs": True},
+        )
+        mm_kwargs = {
+            "return_timestamps": True,
+            "timestamp_granularities": ["word"],
+        }
+    else:
+        sampling = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+        mm_kwargs = None
+    texts = []
+    for _chunk_s, piece in chunks:
+        outs = _e2e_one_request(llm, piece, sr, sampling, mm_kwargs=mm_kwargs)
+        texts.append(_print_output_text(outs))
+    return " ".join(part for part in texts if part)
+
+
 def _run_e2e(args: argparse.Namespace) -> int:
     """Offline LLM.chat like nemotron-api: 7.9 s / 121 s / chunked long file."""
     from vllm import LLM
-    from vllm.sampling_params import SamplingParams
 
     os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -709,73 +839,79 @@ def _run_e2e(args: argparse.Namespace) -> int:
         },
         enable_prefix_caching=False,
     )
+    embed_hashes = _install_embed_hash_probe(llm)
     after_load = _unique_graphs()
     print(f"unique_graphs after load={after_load}")
     failed = 0
+    # Same clip must be order/repeat-stable: plain → timestamps → plain → timestamps.
+    order = (
+        ("plain", False),
+        ("timestamps", True),
+        ("plain", False),
+        ("timestamps", True),
+    )
     for sec in seconds:
         wave, sr = _e2e_wave(sec, args.audio)
         chunks = _chunk_e2e_audio(sec, wave, sr)
         print(
-            f"--- plain {sec}s ({len(wave)} samples @ {sr}, {len(chunks)} chunk(s)) ---"
+            f"--- {sec}s order check "
+            f"({len(wave)} samples @ {sr}, {len(chunks)} chunk(s)) ---"
         )
-        try:
-            before = _unique_graphs()
-            texts = []
-            for chunk_s, piece in chunks:
-                outs = _e2e_one_request(
+        texts: list[str] = []
+        hashes: list[tuple[str, ...]] = []
+        for label, timestamps in order:
+            try:
+                before = _unique_graphs()
+                start = len(embed_hashes)
+                text = _e2e_clip_request(
                     llm,
-                    piece,
+                    chunks,
                     sr,
-                    SamplingParams(temperature=0.0, max_tokens=args.e2e_max_tokens),
+                    timestamps=timestamps,
+                    max_tokens=args.e2e_max_tokens,
                 )
-                texts.append(_print_output_text(outs))
-            text = " ".join(part for part in texts if part)
-            after = _unique_graphs()
-            print(f"  graphs {before} -> {after}")
-            print(f"  text[:240]={text[:240]!r}")
-            if not text.strip():
+                after = _unique_graphs()
+                request_hashes = tuple(embed_hashes[start:])
+                texts.append(text)
+                hashes.append(request_hashes)
+                print(f"  {label} graphs {before} -> {after}")
+                print(f"  {label} text[:240]={text[:240]!r}")
+                print(f"  {label} emb_hashes={request_hashes}")
+                if not text.strip():
+                    failed += 1
+                    print(f"  FAIL: empty {label} transcript")
+                if timestamps and after != before and before >= 0:
+                    failed += 1
+                    print("  FAIL: timestamp path created new dynamo graphs")
+                if (
+                    not timestamps
+                    and after_load >= 0
+                    and after > after_load
+                    and before == after_load
+                ):
+                    print("  WARN: new graphs on this request")
+            except Exception as exc:
                 failed += 1
-                print("  FAIL: empty transcript")
-            if after_load >= 0 and after > after_load and before == after_load:
-                print("  WARN: new graphs on this request")
-        except Exception as exc:
-            failed += 1
-            print(f"  plain FAIL: {exc}")
-            traceback.print_exc()
-        print(f"--- timestamps/verbose {sec}s ---")
-        try:
-            before = _unique_graphs()
-            texts = []
-            for chunk_s, piece in chunks:
-                outs = _e2e_one_request(
-                    llm,
-                    piece,
-                    sr,
-                    SamplingParams(
-                        temperature=0.0,
-                        max_tokens=args.e2e_max_tokens,
-                        extra_args={"return_ctc_timestamp_inputs": True},
-                    ),
-                    mm_kwargs={
-                        "return_timestamps": True,
-                        "timestamp_granularities": ["word"],
-                    },
-                )
-                texts.append(_print_output_text(outs))
-            text = " ".join(part for part in texts if part)
-            after = _unique_graphs()
-            print(f"  graphs {before} -> {after}")
-            print(f"  text[:240]={text[:240]!r}")
-            if not text.strip():
+                print(f"  {label} FAIL: {exc}")
+                traceback.print_exc()
+                texts.append("")
+                hashes.append(())
+        if len(texts) == 4 and all(texts):
+            if len(set(texts)) != 1:
                 failed += 1
-                print("  FAIL: empty transcript")
-            if after != before and before >= 0:
+                print("  FAIL: plain/timestamps text drifted across order/repeat")
+                for idx, (label, _) in enumerate(order):
+                    print(f"    {idx}:{label} {texts[idx][:120]!r}")
+            else:
+                print("  text order/repeat OK")
+            nonempty_hashes = [h for h in hashes if h]
+            if nonempty_hashes and len(set(nonempty_hashes)) != 1:
                 failed += 1
-                print("  FAIL: timestamp path created new dynamo graphs")
-        except Exception as exc:
-            failed += 1
-            print(f"  timestamps FAIL: {exc}")
-            traceback.print_exc()
+                print("  FAIL: encoder embedding hashes drifted across order/repeat")
+                for idx, (label, _) in enumerate(order):
+                    print(f"    {idx}:{label} {hashes[idx]}")
+            elif nonempty_hashes:
+                print("  emb hash order/repeat OK")
     print(f"e2e done failed={failed} unique_graphs={_unique_graphs()}")
     _shutdown_llm(llm)
     return 1 if failed else 0
