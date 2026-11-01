@@ -100,6 +100,54 @@ def _padding_block_mask(create_block_mask, frames: int, valid: int, device):
     return create_block_mask(mask_mod, 1, None, frames, frames, device=device)
 
 
+def _true_eager_windows(block: _NeMoStyleFlexBlock, x: torch.Tensor) -> torch.Tensor:
+    """Reference encode with raw flex / create_block_mask (no vLLM wrapper)."""
+    from torch.nn.attention.flex_attention import (
+        create_block_mask as raw_create,
+    )
+    from torch.nn.attention.flex_attention import (
+        flex_attention as raw_flex,
+    )
+
+    valid = x.shape[1]
+    parts = []
+    if valid <= 2 * _ENCODER_WINDOW:
+        chunks = [(x, valid)]
+    else:
+        chunks = []
+        for start in range(0, valid, _ENCODER_WINDOW):
+            chunk = x[:, start : start + _ENCODER_WINDOW]
+            chunks.append((chunk, chunk.shape[1]))
+    for chunk, chunk_valid in chunks:
+        residual = chunk
+        h = block.norm(chunk)
+        batch, frames, dim = h.shape
+        qkv = block.qkv(h).view(batch, frames, 3, block.n_heads, block.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        def score_mod(score, _b, _h, q_idx, kv_idx):
+            return score + (q_idx - kv_idx).to(score.dtype) * 0.01
+
+        def mask_mod(_b, _h, q_idx, kv_idx, _valid=chunk_valid):
+            return (q_idx < _valid) & (kv_idx < _valid)
+
+        mask = raw_create(mask_mod, 1, None, frames, frames, device=x.device)
+        y = raw_flex(
+            q,
+            k,
+            v,
+            score_mod=score_mod,
+            block_mask=mask,
+            kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
+        )
+        y = y.transpose(1, 2).reshape(batch, frames, dim)
+        parts.append((block.out(y) + residual)[:, :chunk_valid])
+    return torch.cat(parts, dim=1)
+
+
 def _rel_err(compiled: torch.Tensor, eager: torch.Tensor) -> float:
     scale = eager.detach().float().abs().amax().clamp_min(1e-3)
     return float((compiled.float() - eager.float()).abs().amax() / scale)
@@ -316,3 +364,181 @@ def test_compiled_encoder_embeddings_stable_after_varied_burst():
     assert first.shape[1] == _LONG_FRAMES
     assert torch.equal(first, second)
     envs.disable_envs_cache()
+
+
+# 80 ms / encoder frame: 99≈7.9 s, 1513≈121 s.
+_ALIGNER_FRAMES = (550, 600, 1100)
+_VARIATION_FRAMES = (99, 256, 550, 1100, 1513)
+
+
+def _force_use_ok(kwargs: dict) -> bool:
+    opts = kwargs.get("kernel_options") or {}
+    return bool(opts.get("FORCE_USE_FLEX_ATTENTION"))
+
+
+def test_aligner_like_flex_after_warmup_no_recompile_or_dense():
+    """Call flex like ctc_timestamp_utils.trunk: no inference_mode, no grad.
+
+    After a serving warmup, unique_graphs must not grow and every call
+    must keep FORCE_USE_FLEX_ATTENTION (no dense math fallback).
+    """
+    from torch._dynamo.utils import counters
+
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+    from vllm.compilation.mm_encoder import configure_speech_encoder_dynamo
+
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    import vllm.envs as envs
+
+    envs.disable_envs_cache()
+    mm_encoder_mod._INDUCTOR_PINNED = False
+    isolate_flex_attention_from_compile()
+    configure_speech_encoder_dynamo()
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=_ENCODER_WINDOW, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._MASK_STATE.clear()
+    mm_encoder_mod._set_serving_watch(True)
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    seen: list[str] = []
+    force: list[bool] = []
+
+    def compiled_flex(q, k, v, **kwargs):
+        seen.append("compiled")
+        force.append(_force_use_ok(kwargs))
+        return q
+
+    def eager_flex(q, k, v, **kwargs):
+        seen.append("eager")
+        force.append(_force_use_ok(kwargs))
+        return q
+
+    compiled = torch.compile(compiled_flex, dynamic=False, backend="eager")
+    mm_encoder_mod._EAGER_FLEX = eager_flex
+    wrapped = mm_encoder_mod._pad_flex_wrapper(compiled)
+
+    torch._dynamo.reset()
+    counters.clear()
+    with torch.inference_mode():
+        for frames in (256, 550, 768, 1100):
+            q = torch.randn(1, 16, frames, 80, device=device, dtype=dtype)
+            wrapped(q, q, q)
+    after_warmup = int(counters["stats"]["unique_graphs"])
+    seen.clear()
+    force.clear()
+
+    assert not mm_encoder_mod._is_inference_mode()
+    for frames in _ALIGNER_FRAMES:
+        q = torch.randn(2, 16, frames, 80, device=device, dtype=dtype)
+        assert not q.requires_grad
+        assert not mm_encoder_mod._tensor_is_inference(q)
+        out = wrapped(q, q, q)
+        assert out.shape[-2] == frames
+    assert seen == ["eager"] * len(_ALIGNER_FRAMES)
+    assert force == [True] * len(_ALIGNER_FRAMES)
+    assert int(counters["stats"]["unique_graphs"]) == after_warmup
+    mm_encoder_mod._set_serving_watch(False)
+    envs.disable_envs_cache()
+
+
+def test_varied_valid_lengths_match_eager_including_ami_and_short():
+    """7.9 s, 121 s, and on-bucket lengths vs eager reference."""
+    create_block_mask = _try_create_block_mask()
+    isolate_flex_attention_from_compile()
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=_ENCODER_WINDOW, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._MASK_STATE.clear()
+    torch.manual_seed(2)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    eager_block = _NeMoStyleFlexBlock().to(device=device, dtype=dtype)
+    compiled_block = _NeMoStyleFlexBlock().to(device=device, dtype=dtype)
+    compiled_block.load_state_dict(eager_block.state_dict())
+    compiled_block.compile(**speech_encoder_layer_compile_kwargs())
+
+    with torch.inference_mode():
+        for frames in (256, 550, 1100):
+            x = torch.randn(1, frames, 64, device=device, dtype=dtype)
+            _encode_windows(compiled_block, x, create_block_mask)
+        for frames in _VARIATION_FRAMES:
+            torch.manual_seed(10 + frames)
+            x = torch.randn(1, frames, 64, device=device, dtype=dtype)
+            mm_encoder_mod._begin_encoder_mask(frames)
+            compiled = _encode_windows(compiled_block, x, create_block_mask)
+            eager = _true_eager_windows(eager_block, x)
+            rel = _rel_err(compiled, eager)
+            assert rel < 0.08, f"T={frames} compiled vs eager rel={rel:.3f}"
+            assert compiled.shape[1] == frames
+            same_am = int(torch.argmax(compiled.float()).item()) == int(
+                torch.argmax(eager.float()).item()
+            )
+            assert same_am or rel < 0.05, f"T={frames} argmax diverged rel={rel:.3f}"
+
+
+def test_ami_and_short_stable_after_varied_burst():
+    """Same 7.9 s / 121 s / on-bucket input bitwise after a mixed burst."""
+    create_block_mask = _try_create_block_mask()
+    isolate_flex_attention_from_compile()
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=_ENCODER_WINDOW, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._MASK_STATE.clear()
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    block = _NeMoStyleFlexBlock().to(device=device, dtype=dtype)
+    block.compile(**speech_encoder_layer_compile_kwargs())
+    probes = {
+        frames: torch.randn(1, frames, 64, device=device, dtype=dtype)
+        for frames in _VARIATION_FRAMES
+    }
+    burst = (1, 50, 99, 129, 256, 400, 549, 551, 800, 1100, 1513, 1906)
+
+    with torch.inference_mode():
+        first = {
+            frames: _encode_windows(block, x, create_block_mask)
+            for frames, x in probes.items()
+        }
+        for frames in burst:
+            other = torch.randn(1, frames, 64, device=device, dtype=dtype)
+            _encode_windows(block, other, create_block_mask)
+        second = {
+            frames: _encode_windows(block, x, create_block_mask)
+            for frames, x in probes.items()
+        }
+    for frames in _VARIATION_FRAMES:
+        assert torch.equal(first[frames], second[frames]), f"T={frames} drifted"
+
+
+def test_mask_valid_tensor_updates_before_cuda_graph_replay():
+    """fill_ valid_q before replay; the graph must load the new value."""
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+
+    device = torch.device("cuda")
+    mm_encoder_mod._MASK_STATE.clear()
+    state = mm_encoder_mod._mask_state(device)
+    mm_encoder_mod.speech_encoder_set_mask_valid(device, 256)
+    out = torch.zeros((), device=device, dtype=torch.int32)
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph.capture_begin()
+        out.copy_(state["valid_q"])
+        graph.capture_end()
+    torch.cuda.current_stream().wait_stream(stream)
+    mm_encoder_mod.speech_encoder_set_mask_valid(device, 99)
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert int(out.item()) == 99
+    mm_encoder_mod.speech_encoder_set_mask_valid(device, 1513)
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert int(out.item()) == 1513

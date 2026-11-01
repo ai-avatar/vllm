@@ -112,9 +112,13 @@ up to the audio cap) using `n_feat` from the perception preprocessor
 long-audio `3 * window` dummy. The plugin still windows by
 `processed_len`, so last-window T is `valid % window`; flex q/k/v
 and the block mask pad to `window` (or the next 256-bucket).
-`mask_mod` reads the valid length from a tensor (not a Python int)
-and the timestamp aligner uses uncompiled FORCE_USE flex under
-`inference_mode`. Flex is compiled with `dynamic=False` so those
+`mask_mod` reads the valid length from a tensor (not a Python int);
+that tensor is written before each call and before CUDA-graph replay
+(never baked during capture). Cached BlockMasks are a full bucket so
+a short first request cannot empty tail blocks for a later longer
+one. Any encoder call outside `inference_mode` (the timestamp
+aligner) is promoted to inference tensors and uses uncompiled
+FORCE_USE flex. Flex is compiled with `dynamic=False` so those
 remainders cannot recompile. Compile-only skips dummy-audio warmup. Warmup time is
 logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped
 module (`model.unwrap()` / `.runnable`) because

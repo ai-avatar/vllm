@@ -185,8 +185,11 @@ in the decode or prefill batch.
   `3 * window` dummy (n_feat from the preprocessor / encoder). Flex
   q/k/v and `create_block_mask` pad last-window remainders
   (`valid % window` from the plugin) onto that closed set.
-  `mask_mod` reads valid length from a tensor; the timestamp aligner
-  uses uncompiled FORCE_USE flex under `inference_mode`. Flex
+  `mask_mod` reads valid length from a tensor (written before each
+  call / CUDA-graph replay). The timestamp aligner — and any encoder
+  call outside `inference_mode` — is promoted to inference tensors
+  and uses uncompiled FORCE_USE flex. Cached BlockMasks are a full
+  bucket so a short valid cannot empty tail blocks. Flex
   compiles with `dynamic=False`. The path is a function of each item's
   valid length. Compiled encoder / flex kernels pin inductor
   `deterministic` (and disable timing `max_autotune` /

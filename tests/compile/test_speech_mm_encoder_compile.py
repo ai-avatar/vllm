@@ -850,11 +850,13 @@ def test_flex_wrapper_pads_qkv_and_crops_to_valid():
         seen["contig"] = q.is_contiguous()
         return q
 
+    mm_encoder_mod._EAGER_FLEX = None
     wrapped = mm_encoder_mod._pad_flex_wrapper(fake_flex)
     q = torch.randn(1, 2, 400, 8)
     k = torch.randn(1, 2, 400, 8)
     v = torch.randn(1, 2, 400, 8)
-    out = wrapped(q, k, v)
+    with torch.inference_mode():
+        out = wrapped(q, k, v)
     assert seen["shape"] == (1, 2, 550, 8)
     assert seen["contig"] is True
     assert out.shape == q.shape
@@ -996,6 +998,108 @@ def test_aligner_path_uses_eager_flex_and_does_not_recompile():
     assert out.shape[-2] == 600
     assert seen == ["eager"]
     assert int(counters["stats"]["unique_graphs"]) == after_warmup
+
+
+def test_non_inference_non_grad_uses_eager_flex_and_does_not_recompile():
+    """Aligner tensors are ordinary AutogradCUDA, not requires_grad."""
+    from torch._dynamo.utils import counters
+
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._set_serving_watch(False)
+    seen: list[str] = []
+
+    def compiled_flex(q, k, v, **kwargs):
+        seen.append("compiled")
+        return q
+
+    def eager_flex(q, k, v, **kwargs):
+        seen.append("eager")
+        assert kwargs.get("kernel_options", {}).get("FORCE_USE_FLEX_ATTENTION")
+        return q
+
+    compiled_flex = torch.compile(compiled_flex, dynamic=False, backend="eager")
+    mm_encoder_mod._EAGER_FLEX = eager_flex
+    wrapped = mm_encoder_mod._pad_flex_wrapper(compiled_flex)
+
+    torch._dynamo.reset()
+    counters.clear()
+    with torch.inference_mode():
+        for frames in (256, 550, 768, 1100):
+            q = torch.randn(1, 2, frames, 8)
+            wrapped(q, q, q)
+    after_warmup = int(counters["stats"]["unique_graphs"])
+    seen.clear()
+    assert not mm_encoder_mod._is_inference_mode()
+    q = torch.randn(2, 2, 600, 8)
+    assert not q.requires_grad
+    out = wrapped(q, q, q)
+    assert out.shape[-2] == 600
+    assert seen == ["eager"]
+    assert int(counters["stats"]["unique_graphs"]) == after_warmup
+
+
+def test_on_bucket_q_uses_processed_len_not_padded_shape():
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._MASK_STATE.clear()
+    mm_encoder_mod._begin_encoder_mask(99)
+    mm_encoder_mod._LAST_PROCESSED_LEN = 99
+    seen: dict[str, int] = {}
+
+    def fake_flex(q, k, v, **kwargs):
+        seen["T"] = int(q.shape[-2])
+        state = mm_encoder_mod._mask_state(q.device)
+        seen["valid"] = int(state["valid_q"].item())
+        return q
+
+    mm_encoder_mod._EAGER_FLEX = None
+    wrapped = mm_encoder_mod._pad_flex_wrapper(fake_flex)
+    q = torch.randn(1, 2, 256, 8)
+    with torch.inference_mode():
+        out = wrapped(q, q, q)
+    assert seen["T"] == 256
+    assert seen["valid"] == 99
+    assert out.shape[-2] == 256
+    assert mm_encoder_mod._resolve_flex_valid(256, 256) == 99
+
+
+def test_cached_mask_does_not_empty_tail_for_later_longer_valid():
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._MASK_STATE.clear()
+    q_short = torch.randn(1, 2, 99, 8)
+    mask_short = mm_encoder_mod._cached_block_mask(550, 99, q_short)
+    q_long = torch.randn(1, 2, 550, 8)
+    mask_long = mm_encoder_mod._cached_block_mask(550, 550, q_long)
+    if mask_short is not None and mask_long is not None:
+        assert mask_short is mask_long
+    state = mm_encoder_mod._mask_state(q_long.device)
+    assert bool(state["mask_mod"](0, 0, torch.tensor(549), torch.tensor(549)))
+    mm_encoder_mod._set_mask_valid_len(state, 99, 99)
+    assert not bool(state["mask_mod"](0, 0, torch.tensor(100), torch.tensor(100)))
+    mm_encoder_mod._set_mask_valid_len(state, 550, 550)
+    assert bool(state["mask_mod"](0, 0, torch.tensor(100), torch.tensor(100)))
+
+
+def test_encoder_forward_outside_inference_mode_sets_aligner():
+    model = _SpeechModel()
+    flags: list[tuple[bool, bool]] = []
+
+    def orig(x):
+        flags.append(
+            (mm_encoder_mod._ALIGNER_ACTIVE, mm_encoder_mod._is_inference_mode())
+        )
+        return x
+
+    model.perception.encoder.forward = orig
+    assert mm_encoder_mod._wrap_speech_encoder_inference(model)
+    model.perception.encoder.forward(torch.zeros(1, 4))
+    assert flags == [(True, True)]
+    assert mm_encoder_mod._wrap_speech_encoder_inference(model) is False
 
 
 def test_timestamp_flag_enters_aligner_runtime(monkeypatch: pytest.MonkeyPatch):
