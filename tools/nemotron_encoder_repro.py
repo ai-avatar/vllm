@@ -16,7 +16,8 @@ Examples:
       --seconds 7.9,11,121 --aligner --burst
 
   # Offline LLM e2e (7.9 s, 121 s, ~25 min; plain + timestamp path):
-  python tools/nemotron_encoder_repro.py --model /path/to/ckpt --e2e
+  python tools/nemotron_encoder_repro.py --model /path/to/ckpt --e2e \\
+      --audio /path/to/7.9s.wav,/path/to/ami_121s.wav,/path/to/25min.wav
 
 """
 
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import json
 import os
 import sys
@@ -104,11 +106,7 @@ def _run_flex_only(args: argparse.Namespace) -> int:
     frames = sorted(set(int(f) for f in frames if f > 0))
     print(f"device={device} frames={frames} hop_s={hop}")
 
-    force: list[bool] = []
-
     def eager_flex(q, k, v, **kwargs):
-        opts = kwargs.get("kernel_options") or {}
-        force.append(bool(opts.get("FORCE_USE_FLEX_ATTENTION")))
         return raw_flex(q, k, v, **kwargs)
 
     compiled = torch.compile(eager_flex, dynamic=False)
@@ -133,15 +131,11 @@ def _run_flex_only(args: argparse.Namespace) -> int:
     failed = 0
     if args.aligner:
         print("aligner path: B=2, no inference_mode, no requires_grad")
-        force.clear()
         mm_encoder_mod._set_serving_watch(True)
         for t in (args.window, 600, 2 * args.window):
             try:
                 out = one(2, t, inference=False)
-                print(
-                    f"  T={t} out={tuple(out.shape)} eager_force={force[-1:]} "
-                    f"graphs={_unique_graphs()}"
-                )
+                print(f"  T={t} out={tuple(out.shape)} graphs={_unique_graphs()}")
             except Exception as exc:
                 failed += 1
                 print(f"  T={t} FAIL: {exc}")
@@ -300,6 +294,42 @@ def _payload_to_tensor(payload: dict[str, object]):
     return storage.view(dtype).reshape(shape).clone()
 
 
+def _shutdown_llm(llm) -> None:
+    """Release GPU memory so a second engine can load in this or another process."""
+    if llm is None:
+        return
+    for name in ("shutdown", "close"):
+        fn = getattr(llm, name, None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn()
+    engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+    if engine is not None:
+        for name in ("shutdown", "destroy"):
+            fn = getattr(engine, name, None)
+            if callable(fn):
+                with contextlib.suppress(Exception):
+                    fn()
+        for child_name in ("engine_core", "model_executor"):
+            child = getattr(engine, child_name, None)
+            if child is None:
+                continue
+            fn = getattr(child, "shutdown", None)
+            if callable(fn):
+                with contextlib.suppress(Exception):
+                    fn()
+    del llm
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.accelerator.empty_cache()
+            torch.accelerator.synchronize()
+    except Exception:
+        pass
+
+
 def _eager_encode_worker(model: str, frames: list[int], n_feat: int, out_path: str):
     import torch
 
@@ -401,7 +431,9 @@ def _run_model(args: argparse.Namespace) -> int:
         try:
             with torch.inference_mode():
                 torch.manual_seed(t)
-                compiled_out[t] = encode(compiled_inner, t, inference=True)
+                compiled_out[t] = _tensor_to_payload(
+                    _first_tensor(encode(compiled_inner, t, inference=True))
+                )
             print(f"  compiled T={t} ok")
         except Exception as exc:
             failed += 1
@@ -435,20 +467,24 @@ def _run_model(args: argparse.Namespace) -> int:
             )
         mm_encoder_mod._set_serving_watch(False)
 
-    print("loading eager encoder in a subprocess (do not load two engines here)")
-    del compiled_llm
+    print("freeing compiled engine, then eager subprocess")
+    _shutdown_llm(compiled_llm)
+    compiled_llm = None
+    compiled_inner = None
+    gc.collect()
     if device.type == "cuda":
         torch.accelerator.empty_cache()
+        torch.accelerator.synchronize()
     eager = _run_eager_subprocess(args.model, frames, n_feat)
     if not eager.get("ok"):
-        print(f"WARN: eager subprocess failed: {eager.get('error')}")
-        return 1 if failed else 0
+        print(f"FAIL: eager subprocess failed: {eager.get('error')}")
+        return 1
     print("compiled vs eager (subprocess)")
     for t in frames:
         if t not in compiled_out:
             continue
         try:
-            left = _first_tensor(compiled_out[t])
+            left = _payload_to_tensor(compiled_out[t])
             eager_out = _payload_to_tensor(eager["outs"][str(t)])
             rel = _rel_err(left, eager_out)
             mad = _max_abs(left, eager_out)
@@ -465,13 +501,55 @@ def _run_model(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+_NEMOTRON_TRANSCRIBE_TEXT = "Transcribe with punctuation and capitalization."
+_NEMOTRON_AUDIO_PLACEHOLDERS = ("<|audio|>", "<audio>", "<|AUDIO|>")
+
+
 def _synth_wav(seconds: float, sr: int = 16000):
-    import torch
+    import numpy as np
 
     n = max(int(seconds * sr), 1)
-    t = torch.arange(n, dtype=torch.float32) / float(sr)
-    wave = (0.08 * torch.sin(2 * 3.14159265 * 180.0 * t)).numpy()
+    t = np.arange(n, dtype=np.float32) / float(sr)
+    wave = 0.08 * np.sin(2 * 3.14159265 * 180.0 * t)
     return wave, sr
+
+
+def _load_audio_file(path: str, sr: int = 16000):
+    from vllm.multimodal.media.audio import load_audio
+
+    return load_audio(path, sr=sr)
+
+
+def _e2e_wave(seconds: float, audio_paths: list[str], sr: int = 16000):
+    """Prefer a real file (tiled/cropped to ``seconds``) over a tone."""
+    import numpy as np
+
+    need = max(int(seconds * sr), 1)
+    wave = None
+    if audio_paths:
+        idx = 0
+        if seconds >= 1000:
+            idx = min(2, len(audio_paths) - 1)
+        elif seconds >= 60:
+            idx = min(1, len(audio_paths) - 1)
+        wave, file_sr = _load_audio_file(audio_paths[idx], sr=sr)
+        if file_sr and int(file_sr) != sr:
+            sr = int(file_sr)
+            need = max(int(seconds * sr), 1)
+    if wave is None:
+        try:
+            from vllm.assets.audio import AudioAsset
+
+            wave, file_sr = AudioAsset("mary_had_lamb").audio_and_sample_rate
+            sr = int(file_sr) if file_sr else sr
+            need = max(int(seconds * sr), 1)
+        except Exception:
+            return _synth_wav(seconds, sr)
+    wave = np.asarray(wave, dtype=np.float32).reshape(-1)
+    if wave.size < need:
+        reps = (need + wave.size - 1) // max(wave.size, 1)
+        wave = np.tile(wave, reps)
+    return wave[:need], sr
 
 
 def _print_output_text(outputs) -> str:
@@ -484,6 +562,61 @@ def _print_output_text(outputs) -> str:
     return str(first)
 
 
+def _audio_placeholder_from_llm(llm) -> str | None:
+    tokenizer = None
+    with contextlib.suppress(Exception):
+        tokenizer = llm.get_tokenizer()
+    for obj in (
+        tokenizer,
+        getattr(tokenizer, "processor", None) if tokenizer is not None else None,
+        getattr(llm, "llm_engine", None),
+    ):
+        if obj is None:
+            continue
+        for name in (
+            "audio_token",
+            "audio_placeholder",
+            "audio_token_id",
+            "placeholder_audio",
+        ):
+            raw = getattr(obj, name, None)
+            if isinstance(raw, str) and raw:
+                return raw
+    return None
+
+
+def _nemotron_e2e_prompt(llm, audio) -> dict[str, Any]:
+    """User turn with audio placeholder; no system message."""
+    text = _NEMOTRON_TRANSCRIBE_TEXT
+    tokenizer = None
+    with contextlib.suppress(Exception):
+        tokenizer = llm.get_tokenizer()
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio"},
+                    {"type": "text", "text": text},
+                ],
+            }
+        ]
+        with contextlib.suppress(Exception):
+            rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            if rendered and "audio" in rendered.lower():
+                return {"prompt": rendered, "multi_modal_data": {"audio": audio}}
+    placeholders = []
+    found = _audio_placeholder_from_llm(llm)
+    if found:
+        placeholders.append(found)
+    placeholders.extend(_NEMOTRON_AUDIO_PLACEHOLDERS)
+    ph = placeholders[0]
+    prompt = f"<|im_start|>user\n{ph}{text}<|im_end|>\n<|im_start|>assistant\n"
+    return {"prompt": prompt, "multi_modal_data": {"audio": audio}}
+
+
 def _run_e2e(args: argparse.Namespace) -> int:
     """Offline LLM.generate for 7.9 s / 121 s / ~25 min, plain + timestamps."""
     from vllm import LLM
@@ -493,7 +626,7 @@ def _run_e2e(args: argparse.Namespace) -> int:
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
     os.environ.setdefault("TORCH_LOGS", "recompiles")
     seconds = args.e2e_seconds or [7.9, 121.0, 1500.0]
-    print(f"e2e LLM load {args.model} seconds={seconds}")
+    print(f"e2e LLM load {args.model} seconds={seconds} audio={args.audio}")
     llm = LLM(
         model=args.model,
         dtype="bfloat16",
@@ -508,9 +641,12 @@ def _run_e2e(args: argparse.Namespace) -> int:
     print(f"unique_graphs after load={after_load}")
     failed = 0
     for sec in seconds:
-        wave, sr = _synth_wav(sec)
-        prompt = {"prompt": "", "multi_modal_data": {"audio": (wave, sr)}}
-        print(f"--- plain {sec}s ({len(wave)} samples @ {sr}) ---")
+        wave, sr = _e2e_wave(sec, args.audio)
+        prompt = _nemotron_e2e_prompt(llm, (wave, sr))
+        print(
+            f"--- plain {sec}s ({len(wave)} samples @ {sr}) "
+            f"prompt[:80]={prompt['prompt'][:80]!r} ---"
+        )
         try:
             before = _unique_graphs()
             outs = llm.generate(
@@ -521,6 +657,9 @@ def _run_e2e(args: argparse.Namespace) -> int:
             after = _unique_graphs()
             print(f"  graphs {before} -> {after}")
             print(f"  text[:240]={text[:240]!r}")
+            if not text.strip():
+                failed += 1
+                print("  FAIL: empty transcript")
             if after_load >= 0 and after > after_load and before == after_load:
                 print("  WARN: new graphs on this request")
         except Exception as exc:
@@ -546,6 +685,9 @@ def _run_e2e(args: argparse.Namespace) -> int:
             after = _unique_graphs()
             print(f"  graphs {before} -> {after}")
             print(f"  text[:240]={text[:240]!r}")
+            if not text.strip():
+                failed += 1
+                print("  FAIL: empty transcript")
             if after != before and before >= 0:
                 failed += 1
                 print("  FAIL: timestamp path created new dynamo graphs")
@@ -554,6 +696,7 @@ def _run_e2e(args: argparse.Namespace) -> int:
             print(f"  timestamps FAIL: {exc}")
             traceback.print_exc()
     print(f"e2e done failed={failed} unique_graphs={_unique_graphs()}")
+    _shutdown_llm(llm)
     return 1 if failed else 0
 
 
@@ -577,6 +720,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Durations for --e2e (1500 s ≈ 25 min)",
     )
     parser.add_argument("--e2e-max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--audio",
+        default="",
+        help="Comma-separated real audio paths for --e2e (LibriSpeech/AMI)",
+    )
     parser.add_argument(
         "--seconds",
         default="7.9,11,121",
@@ -605,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
     args.seconds = _parse_floats(args.seconds)
     args.frames = _parse_ints(args.frames)
     args.e2e_seconds = _parse_floats(args.e2e_seconds)
+    args.audio = [part.strip() for part in args.audio.split(",") if part.strip()]
     if args.e2e:
         if not args.model:
             print("--e2e requires --model")

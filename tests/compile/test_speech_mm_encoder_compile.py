@@ -28,6 +28,7 @@ from vllm.compilation.mm_encoder import (
     speech_encoder_layer_compile_kwargs,
     speech_encoder_mask_mod_closes_over_tensors,
     speech_encoder_n_feat,
+    speech_encoder_profile_dummy_frames,
     speech_encoder_served_frames,
     speech_encoder_warmup_frame_buckets,
     speech_encoder_warmup_long_frames,
@@ -849,6 +850,95 @@ def test_flex_bucket_does_not_expand_short_q_to_max_frames():
         speech_encoder_flex_bucket(500, window=550, max_windows=2, bucket_step=256)
         == 550
     )
+
+
+def test_encoder_window_ignores_max_frames_as_sliding_chunk():
+    runner = SimpleNamespace(window=4000, max_frames=4000)
+    assert mm_encoder_mod._encoder_window(runner) is None
+    runner_chunk = SimpleNamespace(window=4000, max_frames=4000, chunk_size=550)
+    assert mm_encoder_mod._encoder_window(runner_chunk) == 550
+    runner_ok = SimpleNamespace(window=550, max_frames=1100)
+    assert mm_encoder_mod._encoder_window(runner_ok) == 550
+
+
+def test_shape_config_does_not_pin_max_frames_as_flex_window():
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    runner = SimpleNamespace(window=4000, max_frames=4000)
+    mm_encoder_mod.set_speech_encoder_shape_config(runner)
+    assert mm_encoder_mod._FLEX_WINDOW == 550
+    assert speech_encoder_flex_bucket(279) == 550
+
+
+def test_profile_dummy_frames_covers_three_times_max_frames():
+    runner = SimpleNamespace(window=4000, max_frames=4000, max_windows=2)
+    assert speech_encoder_profile_dummy_frames(runner) == [12000]
+    runner_short = SimpleNamespace(window=550, max_frames=1100, max_windows=2)
+    assert speech_encoder_profile_dummy_frames(runner_short) == []
+
+
+def test_force_eager_compute_skips_set_stance_while_compiling(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    called: list[str] = []
+
+    def boom(_name: str):
+        called.append(_name)
+        raise RuntimeError("attempted to set_stance in a torch.compile region")
+
+    monkeypatch.setattr(mm_encoder_mod, "_is_torch_compiling", lambda: True)
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "set_stance"):
+        monkeypatch.setattr(compiler, "set_stance", boom)
+    with mm_encoder_mod._force_eager_compute():
+        pass
+    assert called == []
+
+
+def test_compiled_caller_of_pad_wrapper_does_not_set_stance():
+    """Dynamo must not call set_stance from inside the pad wrapper (P3f)."""
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._EAGER_FLEX = None
+
+    def identity(q, k, v, **kwargs):
+        return q
+
+    wrapped = mm_encoder_mod._pad_flex_wrapper(identity)
+
+    def inner(x: torch.Tensor) -> torch.Tensor:
+        return wrapped(x, x, x)
+
+    compiled = torch.compile(inner, backend="eager")
+    q = torch.randn(1, 2, 43, 8)
+    with torch.no_grad():
+        out = compiled(q)
+    assert out.shape[-2] == 43
+
+
+def test_flex_wrapper_makes_transposed_q_contiguous():
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    seen: dict[str, object] = {}
+
+    def fake_flex(q, k, v, **kwargs):
+        seen["contig"] = q.is_contiguous()
+        seen["T"] = int(q.shape[-2])
+        return q
+
+    mm_encoder_mod._EAGER_FLEX = None
+    wrapped = mm_encoder_mod._pad_flex_wrapper(fake_flex)
+    src = torch.randn(1, 279, 8, 64)
+    q = src.transpose(1, 2)
+    assert not q.is_contiguous()
+    with torch.inference_mode():
+        out = wrapped(q, q, q)
+    assert seen["contig"] is True
+    assert seen["T"] == 550
+    assert out.shape[-2] == 279
 
 
 def test_flex_wrapper_pads_qkv_and_crops_to_valid():

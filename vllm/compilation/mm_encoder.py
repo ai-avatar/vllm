@@ -27,10 +27,14 @@ warmed kernel. Layer compile stays dynamic as a fallback for non-flex
 ops. Long-graph warmup is one 3-window dummy plus the per-window
 graph; remainders pad to ``window``. The timestamp aligner (and any
 encoder call outside ``inference_mode``) uses uncompiled FORCE_USE
-flex after promoting inputs to inference tensors. ``mask_mod`` reads
-valid length from a tensor so new lengths cannot recompile. Cached
-BlockMasks are structural (full bucket); the valid-length tensor is
-written before each call / graph replay, never baked during capture.
+flex after promoting inputs to inference tensors. The pad wrapper is
+``torch.compiler.disable``'d so dynamo cannot ``set_stance`` from
+inside a compiled layer; q/k/v are contiguous before the compiled
+flex call. ``mask_mod`` reads valid length from a tensor so new
+lengths cannot recompile. Cached BlockMasks are structural (full
+bucket); the valid-length tensor is written before each call / graph
+replay, never baked during capture. Warmup includes the plugin
+profile dummy (``3 * max_frames`` when that is the 4000-frame cap).
 
 Speech encoder CUDA graphs are captured lazily after KV allocation, with
 batch sizes ``(1,)`` under ``VLLM_BATCH_INVARIANT``. The replay path is a
@@ -300,11 +304,12 @@ def set_speech_encoder_shape_config(
     window: int | None = None,
     max_windows: int | None = None,
     bucket_step: int | None = None,
+    model: Any = None,
 ) -> None:
     """Pin the flex / last-window bucket sizes from the graph runner."""
     global _FLEX_WINDOW, _FLEX_MAX_WINDOWS, _FLEX_BUCKET_STEP
     if window is None:
-        window = _encoder_window(runner)
+        window = _encoder_window(runner, model)
     if window:
         _FLEX_WINDOW = max(int(window), 1)
     if max_windows is None and runner is not None:
@@ -451,6 +456,25 @@ def _tensor_is_inference(tensor: torch.Tensor) -> bool:
     return False
 
 
+def _is_torch_compiling() -> bool:
+    """True while dynamo/inductor is tracing or compiling a region."""
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None:
+        for name in ("is_compiling", "is_dynamo_compiling"):
+            fn = getattr(compiler, name, None)
+            if callable(fn):
+                with contextlib.suppress(Exception):
+                    if bool(fn()):
+                        return True
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None:
+        fn = getattr(dynamo, "is_compiling", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                return bool(fn())
+    return False
+
+
 def _disable_dynamo_fn(fn: Any) -> Any:
     """Return ``fn`` wrapped so dynamo cannot compile it (recursive)."""
     if fn is None or getattr(fn, _DYNAMO_DISABLED_ATTR, False):
@@ -470,9 +494,27 @@ def _disable_dynamo_fn(fn: Any) -> Any:
     return out
 
 
+def _graph_break_if_compiling() -> None:
+    """Force a graph break if dynamo still traced into a disabled helper."""
+    if not _is_torch_compiling():
+        return
+    dynamo = getattr(torch, "_dynamo", None)
+    graph_break = getattr(dynamo, "graph_break", None) if dynamo is not None else None
+    if callable(graph_break):
+        graph_break()
+
+
 @contextlib.contextmanager
 def _force_eager_compute():
-    """Keep the aligner encoder call out of dynamo (no new unique_graphs)."""
+    """Keep the aligner encoder call out of dynamo (no new unique_graphs).
+
+    ``torch.compiler.set_stance`` raises if it is called while dynamo is
+    compiling. Skip it in that case; the caller must already be outside
+    the compiled region (``compiler.disable`` / graph break).
+    """
+    if _is_torch_compiling():
+        yield
+        return
     compiler = getattr(torch, "compiler", None)
     set_stance = getattr(compiler, "set_stance", None) if compiler is not None else None
     if callable(set_stance):
@@ -710,8 +752,11 @@ def _should_use_eager_flex(*tensors: Any) -> bool:
 
     The NeMo timestamp aligner re-runs the encoder outside inference_mode
     with ordinary (not requires_grad) AutogradCUDA tensors. Routing on
-    ``requires_grad`` alone never fires.
+    ``requires_grad`` alone never fires. While dynamo is tracing a
+    serving layer, stay on the compiled path (never ``set_stance``).
     """
+    if _is_torch_compiling():
+        return False
     if _ALIGNER_ACTIVE:
         return True
     tensor_list = [t for t in tensors if isinstance(t, torch.Tensor)]
@@ -804,12 +849,14 @@ def _call_flex_with_static_bucket(
 ) -> Any:
     """Pad flex q/k/v + block_mask to a warmed bucket, then crop.
 
-    Aligner / any non-inference call uses uncompiled FORCE_USE flex after
-    promoting q/k/v to inference tensors so AutogradCUDA / default_dtype
-    cannot recompile into dense attention. Valid length is never taken
-    from the padded q shape when processed_len / create_block_mask Q_LEN
-    is smaller (on-bucket pad leak).
+    Must not run under dynamo: pad / contiguous / mask happen in eager so
+    the compiled flex kernel only sees a closed bucket. Aligner / any
+    non-inference call uses uncompiled FORCE_USE flex after promoting
+    q/k/v to inference tensors. Valid length is never taken from the
+    padded q shape when processed_len / create_block_mask Q_LEN is
+    smaller (on-bucket pad leak).
     """
+    _graph_break_if_compiling()
     kwargs = dict(kwargs)
     args_list = list(args)
     q, k, v = _flex_qkv_from_call(tuple(args_list), kwargs)
@@ -829,11 +876,18 @@ def _call_flex_with_static_bucket(
     q = _detach_flex_tensor(q)
     k = _detach_flex_tensor(k)
     v = _detach_flex_tensor(v)
+    # Transpose from (B, T, H, D) leaves contig=False; dynamo guards
+    # that stride unless we materialize before the compiled flex call.
+    if isinstance(q, torch.Tensor) and not q.is_contiguous():
+        q = q.contiguous()
+    if isinstance(k, torch.Tensor) and not k.is_contiguous():
+        k = k.contiguous()
+    if isinstance(v, torch.Tensor) and not v.is_contiguous():
+        v = v.contiguous()
     orig_t = int(q.shape[-2])
     # Never grow to an incoming mask's seq_lengths (aligner 4000-frame leak).
     bucket = speech_encoder_flex_bucket(orig_t)
     valid = _resolve_flex_valid(orig_t, bucket)
-    _record_flex_input(q, kwargs.get("block_mask"), orig_t=orig_t, bucket=bucket)
     if bucket > orig_t:
         q = _pad_flex_qkv(q, bucket)
         if isinstance(k, torch.Tensor):
@@ -848,6 +902,7 @@ def _call_flex_with_static_bucket(
     new_mask = _cached_block_mask(bucket, valid, q)
     if new_mask is not None:
         kwargs["block_mask"] = new_mask
+    _record_flex_input(q, kwargs.get("block_mask"), orig_t=orig_t, bucket=bucket)
     _set_flex_qkv(args_list, kwargs, q, k, v)
     dtype = q.dtype if isinstance(q, torch.Tensor) and q.is_floating_point() else None
     with _pin_default_dtype(dtype):
@@ -861,6 +916,9 @@ def _call_flex_with_static_bucket(
     return out
 
 
+_call_flex_with_static_bucket = _disable_dynamo_fn(_call_flex_with_static_bucket)
+
+
 def _pad_flex_wrapper(fn: Any) -> Any:
     """Pad flex inputs outside the compiled region (no T guard)."""
     if fn is None or getattr(fn, _FLEX_PADDED_ATTR, False):
@@ -871,11 +929,7 @@ def _pad_flex_wrapper(fn: Any) -> Any:
 
     with contextlib.suppress(Exception):
         wrapped = functools.update_wrapper(wrapped, fn)
-    dynamo = getattr(torch, "_dynamo", None)
-    disable = getattr(dynamo, "disable", None) if dynamo is not None else None
-    if callable(disable):
-        with contextlib.suppress(Exception):
-            wrapped = disable(wrapped, recursive=False)
+    wrapped = _disable_dynamo_fn(wrapped)
     setattr(wrapped, _FLEX_PADDED_ATTR, True)
     setattr(wrapped, _FLEX_ISOLATED_ATTR, True)
     return wrapped
@@ -1539,7 +1593,7 @@ def configure_speech_encoder_graphs(
     if any(not hasattr(runner, name) for name in required):
         return False
 
-    set_speech_encoder_shape_config(runner)
+    set_speech_encoder_shape_config(runner, model=model)
     sizes = default_speech_encoder_graph_batch_sizes(vllm_config)
     current = tuple(int(b) for b in getattr(runner, "batch_sizes", ()) or ())
     hf_config = None
@@ -1800,28 +1854,76 @@ def speech_encoder_warmup_frame_buckets(runner: Any = None) -> list[int]:
     return buckets
 
 
-def _encoder_window(runner: Any) -> int | None:
-    if runner is None:
+_CHUNK_ATTRS = (
+    "chunk_size",
+    "chunk_length",
+    "window_size",
+    "att_window",
+    "streaming_chunk_size",
+    "asr_chunk_size",
+    "att_context_size",
+)
+
+
+def _chunk_from_obj(obj: Any) -> int | None:
+    if obj is None:
         return None
-    raw = getattr(runner, "window", None)
-    for name in ("chunk_size", "chunk_length", "window_size", "att_window"):
-        alt = getattr(runner, name, None)
-        if alt and raw and int(raw) > 2 * int(alt):
-            return max(int(alt), 1)
-    if raw:
-        return max(int(raw), 1)
+    for name in _CHUNK_ATTRS:
+        alt = getattr(obj, name, None)
+        if isinstance(alt, (list, tuple)) and alt:
+            alt = alt[0]
+        n = _as_pos_int(alt)
+        if n is not None and 8 < n < 2048:
+            return n
     return None
 
 
-def speech_encoder_warmup_long_frames(runner: Any = None) -> list[int]:
+def _encoder_window(runner: Any, model: Any = None) -> int | None:
+    """Sliding encoder chunk. ``runner.window`` is often ``max_frames``."""
+    raw = _as_pos_int(getattr(runner, "window", None) if runner else None)
+    max_f = _as_pos_int(getattr(runner, "max_frames", None) if runner else None)
+    objs: list[Any] = [runner]
+    if runner is not None:
+        for name in ("encoder", "asr_encoder", "model", "perception"):
+            objs.append(getattr(runner, name, None))
+    if model is not None:
+        inner = unwrap_speech_encoder_model(model)
+        perception = getattr(inner, "perception", None)
+        encoder = getattr(perception, "encoder", None)
+        objs.extend(
+            (
+                inner,
+                perception,
+                encoder,
+                getattr(encoder, "asr_encoder", None) if encoder else None,
+            )
+        )
+    for obj in objs:
+        chunk = _chunk_from_obj(obj)
+        if chunk is None:
+            continue
+        if raw is None or raw > 2 * chunk or (max_f is not None and raw == max_f):
+            return chunk
+    if raw is not None and raw >= 2048:
+        return None
+    if raw is not None and max_f is not None and raw == max_f and raw > 1100:
+        return None
+    if raw:
+        return raw
+    return None
+
+
+def speech_encoder_warmup_long_frames(
+    runner: Any = None, model: Any = None
+) -> list[int]:
     """One 3-window dummy for long-audio window-graph warmup (BI batch 1).
 
     Flex q/k/v and ``create_block_mask`` pad last-window remainders to
     ``window``, so extra ``n_windows * window`` captures only inflate
     reused-cache ready time.
     """
-    set_speech_encoder_shape_config(runner)
-    window = _encoder_window(runner)
+    set_speech_encoder_shape_config(runner, model=model)
+    window = _encoder_window(runner, model)
     if window is None:
         return []
     short_windows = int(getattr(runner, "max_windows", None) or _DEFAULT_MAX_WINDOWS)
@@ -1830,6 +1932,26 @@ def speech_encoder_warmup_long_frames(runner: Any = None) -> list[int]:
     if length > _audio_cap_frames():
         return []
     return [length]
+
+
+def speech_encoder_profile_dummy_frames(
+    runner: Any = None, model: Any = None
+) -> list[int]:
+    """Processed lengths ``profile_run`` still forwards after graph warmup.
+
+    The plugin dummy is ``(1, n_feat, 3 * max_frames)`` when
+    ``max_frames`` is the 4000-frame cap (12000). That exceeds the
+    audio-duration cap, so the 3-window warmup never saw it.
+    """
+    set_speech_encoder_shape_config(runner, model=model)
+    max_f = _as_pos_int(getattr(runner, "max_frames", None) if runner else None)
+    if max_f is None or max_f < 2048:
+        return []
+    dummy = 3 * max_f
+    warmed = set(speech_encoder_warmup_long_frames(runner, model))
+    if dummy in warmed:
+        return []
+    return [dummy]
 
 
 def _int_feat(value: Any) -> int | None:
@@ -1984,10 +2106,13 @@ def _warmup_long_graphs(
     call_long = getattr(runner, "_call_long", None)
     if not callable(call_long):
         return
-    lengths = speech_encoder_warmup_long_frames(runner)
+    lengths = list(speech_encoder_warmup_long_frames(runner, model))
+    for extra in speech_encoder_profile_dummy_frames(runner, model):
+        if extra not in lengths:
+            lengths.append(extra)
     if not lengths:
         return
-    window = _encoder_window(runner)
+    window = _encoder_window(runner, model)
     device = _model_device(model)
     logger.info(
         "Speech encoder warmup capturing long-audio window graphs "
@@ -2055,6 +2180,7 @@ def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
 
     started = time.perf_counter()
     _set_serving_watch(False)
+    set_speech_encoder_shape_config(runner, model=inner)
     with torch.inference_mode(), _pin_speech_encoder_inductor():
         stats = _warmup_graphs(runner, inner)
     stats.elapsed_s = time.perf_counter() - started

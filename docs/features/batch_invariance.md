@@ -187,8 +187,11 @@ in the decode or prefill batch.
   (`valid % window` from the plugin) onto that closed set.
   `mask_mod` reads valid length from a tensor (written before each
   call / CUDA-graph replay). `create_block_mask` keeps the caller's
-  seq_lengths; the flex wrapper pads q/k/v and builds a matching
-  bucket mask so an unpadded call cannot see a cached 550-mask.
+  seq_lengths; the flex wrapper is `torch.compiler.disable`'d
+  (recursive) so dynamo cannot trace pad / `set_stance` into a
+  compiled layer, and q/k/v are made contiguous before the compiled
+  flex call. Warmup also runs the plugin profile dummy
+  (`3 * max_frames` when that cap is 4000).
   The timestamp aligner is `torch.compiler.disable`'d (no new
   unique_graphs). Flex
   compiles with `dynamic=False`. The path is a function of each item's

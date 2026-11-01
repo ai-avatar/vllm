@@ -116,10 +116,15 @@ and the block mask pad to `window` (or the next 256-bucket).
 that tensor is written before each call and before CUDA-graph replay
 (never baked during capture). `create_block_mask` keeps the caller's
 seq_lengths; the flex wrapper always pads q/k/v to the bucket and
-builds a matching mask. The timestamp aligner is
+builds a matching mask. The flex pad wrapper is `torch.compiler.disable`'d (recursive) so
+dynamo cannot trace pad / `set_stance` / mask into a compiled
+layer; q/k/v are `.contiguous()` before the compiled flex call.
+The timestamp aligner is
 `torch.compiler.disable`'d so it cannot add unique_graphs. A
 profile dummy with `window=max_frames` (e.g. 4000) does not pad a
-500-frame slice to 4000. Flex is compiled with `dynamic=False` so
+500-frame slice to 4000, and warmup also runs the
+`(1, n_feat, 3 * max_frames)` dummy `profile_run` still forwards.
+Flex is compiled with `dynamic=False` so
 those remainders cannot recompile. Compile-only skips dummy-audio warmup. Warmup time is
 logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped
 module (`model.unwrap()` / `.runnable`) because
