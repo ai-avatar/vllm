@@ -546,8 +546,9 @@ class CompilationConfig:
     ``EncoderGraphRunner``. The effective value is written back to both
     configs. Capture and layer compile are deferred until after KV
     allocation, then a post-KV warmup captures every (batch, bucket)
-    with the preprocessor's ``n_feat``. Capture of a later missing
-    bucket is still lazy. Under
+    with the preprocessor's ``n_feat`` and a compact long-audio
+    window-graph set. Capture of a later missing bucket is still lazy.
+    Under
     ``VLLM_BATCH_INVARIANT`` the default batch grid is ``(1,)``. vLLM's
     vision
     ``EncoderCudaGraphManager`` is used only when the model implements

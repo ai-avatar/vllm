@@ -106,9 +106,10 @@ shorter than 128 encoder frames (10.24 s). The leftover
 deferred until after KV allocation; a post-KV graph warmup then
 captures every `(batch, frame-bucket)` (under BI: batch 1 × buckets
 up to the audio cap) using `n_feat` from the perception preprocessor
-/ encoder (`features` / `feat_in`, 128 mels here). Compile-only
-skips dummy-audio warmup. Warmup time is logged and is not counted as
-peak activation. Pending-compile state is stored on the unwrapped
+/ encoder (`features` / `feat_in`, 128 mels here), then long-audio
+window graphs (3-window dummy plus window-count / last-width
+variants). Compile-only skips dummy-audio warmup. Warmup time is
+logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped
 module (`model.unwrap()` / `.runnable`) because
 `CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.
 Capture of a missing bucket after warmup is still lazy. Under

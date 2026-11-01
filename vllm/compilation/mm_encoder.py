@@ -24,8 +24,10 @@ function of each item's valid length, not the padded tensor width.
 Layer compile is also deferred until after KV so inductor workspaces are
 not counted as peak activation. A post-KV graph warmup then captures
 every (batch, frame-bucket) using ``n_feat`` from the perception
-preprocessor / encoder. Compile-only skips dummy-audio warmup (dynamic
-shapes). Pending-compile state is stored on the unwrapped module:
+preprocessor / encoder, then a compact long-audio window-graph set
+(3-window dummy plus window-count / last-width variants, BI batch 1).
+Compile-only skips dummy-audio warmup (dynamic shapes).
+Pending-compile state is stored on the unwrapped module:
 ``CUDAGraphWrapper.__getattr__`` forwards, but ``delattr`` does not.
 """
 
@@ -74,6 +76,11 @@ _MAX_ENCODER_GRAPH_BATCH = 8
 _ENCODER_FRAME_HOP_S = 0.08
 _DEFAULT_FRAME_BUCKET = 256
 _DEFAULT_MAX_WINDOWS = 2
+# First long-audio path is 3 windows (2-window clips stay whole-forward).
+_LONG_WARMUP_MIN_WINDOWS = 3
+# Keep long-window warmup well under the ~30 s budget (I2 whole-forward
+# warmup was 10.85 s / 32 graphs).
+_MAX_LONG_WARMUP_SHAPES = 24
 _FEAT_ATTRS = (
     "features",
     "n_mels",
@@ -821,6 +828,68 @@ def speech_encoder_warmup_frame_buckets(runner: Any = None) -> list[int]:
     return buckets
 
 
+def _encoder_window(runner: Any) -> int | None:
+    raw = getattr(runner, "window", None) if runner is not None else None
+    if raw:
+        return max(int(raw), 1)
+    return None
+
+
+def speech_encoder_warmup_long_frames(runner: Any = None) -> list[int]:
+    """Frame lengths for long-audio window-graph warmup (BI batch 1).
+
+    Whole-forward graphs cover at most two windows. The first longer
+    item (about 2.5–3 min at 80 ms/frame) hits ``_call_long`` and
+    captures ``_ASRWindowGraphs`` / last-width variants on the spot.
+    Cover 3 windows plus a sparse ``(n_windows, last_width)`` grid up
+    to the audio cap, capped so warmup stays near 30 s.
+    """
+    window = _encoder_window(runner)
+    if window is None:
+        return []
+    cap = _audio_cap_frames()
+    short_windows = int(getattr(runner, "max_windows", None) or _DEFAULT_MAX_WINDOWS)
+    min_long = short_windows * window + 1
+    max_windows = max(_LONG_WARMUP_MIN_WINDOWS, (cap + window - 1) // window)
+    step = min(_frame_bucket_step(runner), window)
+    last_widths: list[int] = []
+    width = step
+    while width < window:
+        last_widths.append(width)
+        width += step
+    if window not in last_widths:
+        last_widths.append(window)
+
+    counts = [_LONG_WARMUP_MIN_WINDOWS]
+    for extra in (4, 5, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128):
+        if extra <= max_windows and extra not in counts:
+            counts.append(extra)
+    if max_windows not in counts:
+        counts.append(max_windows)
+
+    frames: list[int] = []
+    for n_windows in counts:
+        for last in last_widths:
+            length = (n_windows - 1) * window + last
+            if min_long <= length <= cap:
+                frames.append(length)
+    frames = sorted(set(frames))
+    if len(frames) <= _MAX_LONG_WARMUP_SHAPES:
+        return frames
+    three_win = [f for f in frames if f <= _LONG_WARMUP_MIN_WINDOWS * window]
+    rest = [f for f in frames if f > _LONG_WARMUP_MIN_WINDOWS * window]
+    keep = _MAX_LONG_WARMUP_SHAPES - len(three_win)
+    if keep <= 0:
+        return three_win[:_MAX_LONG_WARMUP_SHAPES]
+    if keep == 1:
+        return three_win + [frames[-1]]
+    stride = max(1, len(rest) // keep)
+    picked = rest[::stride][:keep]
+    if frames[-1] not in three_win and frames[-1] not in picked:
+        picked = picked[:-1] + [frames[-1]]
+    return sorted(set(three_win + picked))
+
+
 def _int_feat(value: Any) -> int | None:
     if value is None or isinstance(value, bool):
         return None
@@ -893,6 +962,7 @@ class SpeechEncoderWarmupStats:
 
     elapsed_s: float = 0.0
     captured: int = 0
+    long_captured: int = 0
     failed: int = 0
 
 
@@ -943,7 +1013,8 @@ def _warmup_graphs(runner: Any, model: Any) -> SpeechEncoderWarmupStats:
                     n_feat,
                     exc,
                 )
-    if stats.captured == 0:
+    _warmup_long_graphs(runner, inner, n_feat, dtype, stats)
+    if stats.captured == 0 and stats.long_captured == 0:
         logger.error(
             "Speech encoder warmup captured 0 graph(s) (%d failure(s)). "
             "Window / long-audio graphs must not be disabled; check n_feat.",
@@ -952,14 +1023,62 @@ def _warmup_graphs(runner: Any, model: Any) -> SpeechEncoderWarmupStats:
     return stats
 
 
+def _model_device(model: Any) -> torch.device:
+    inner = unwrap_speech_encoder_model(model)
+    if isinstance(inner, nn.Module):
+        for param in inner.parameters():
+            return param.device
+    return torch.device("cpu")
+
+
+def _warmup_long_graphs(
+    runner: Any,
+    model: Any,
+    n_feat: int,
+    dtype: torch.dtype,
+    stats: SpeechEncoderWarmupStats,
+) -> None:
+    """Capture long-audio window graphs via ``_call_long`` (BI batch 1)."""
+    call_long = getattr(runner, "_call_long", None)
+    if not callable(call_long):
+        return
+    lengths = speech_encoder_warmup_long_frames(runner)
+    if not lengths:
+        return
+    window = _encoder_window(runner)
+    device = _model_device(model)
+    logger.info(
+        "Speech encoder warmup capturing long-audio window graphs "
+        "(%d shape(s), window=%s, BI batch 1).",
+        len(lengths),
+        window,
+    )
+    for frames in lengths:
+        processed = torch.zeros(1, n_feat, frames, device=device, dtype=dtype)
+        processed_len = torch.tensor([frames], device=device, dtype=torch.int64)
+        try:
+            call_long(processed, processed_len, False)
+            stats.long_captured += 1
+            stats.captured += 1
+        except Exception as exc:
+            stats.failed += 1
+            logger.error(
+                "Speech encoder long-window warmup failed for 1 x %d frames "
+                "(n_feat=%d): %s",
+                frames,
+                n_feat,
+                exc,
+            )
+
+
 def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
     """Capture graph buckets after KV. Compile-only does not dummy-encode.
 
-    Under ``VLLM_BATCH_INVARIANT`` the grid is batch 1 × frame buckets
-    up to ``min(runner.max_frames, audio cap)``. ``layer.compile``
-    already uses dynamic shapes, so compile-only skips this warmup
-    (186 dummy clips at a 3600 s cap took 293 s). Must not run during
-    memory profiling.
+    Under ``VLLM_BATCH_INVARIANT`` the whole-forward grid is batch 1 ×
+    frame buckets, then ``_call_long`` warms 3-window plus a sparse
+    window-count / last-width set up to the audio cap. ``layer.compile``
+    already uses dynamic shapes, so compile-only skips this warmup.
+    Must not run during memory profiling.
 
     Returns:
         Capture counts and elapsed seconds.
@@ -984,9 +1103,10 @@ def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
     stats.elapsed_s = time.perf_counter() - started
     logger.info(
         "Speech encoder warmup finished in %.2f s (captured %d graph(s), "
-        "%d failure(s)).",
+        "%d long-window, %d failure(s)).",
         stats.elapsed_s,
         stats.captured,
+        stats.long_captured,
         stats.failed,
     )
     return stats
