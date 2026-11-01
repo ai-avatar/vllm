@@ -22,9 +22,10 @@ Speech encoder CUDA graphs are captured lazily after KV allocation, with
 batch sizes ``(1,)`` under ``VLLM_BATCH_INVARIANT``. The replay path is a
 function of each item's valid length, not the padded tensor width.
 Layer compile is also deferred until after KV so inductor workspaces are
-not counted as peak activation. A post-KV warmup then compiles and
-captures every (batch, frame-bucket) so the first real request has no
-spike. Pending-compile state is stored on the unwrapped module:
+not counted as peak activation. A post-KV graph warmup then captures
+every (batch, frame-bucket) using ``n_feat`` from the perception
+preprocessor / encoder. Compile-only skips dummy-audio warmup (dynamic
+shapes). Pending-compile state is stored on the unwrapped module:
 ``CUDAGraphWrapper.__getattr__`` forwards, but ``delattr`` does not.
 """
 
@@ -35,6 +36,7 @@ import functools
 import sys
 import time
 import weakref
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -68,15 +70,21 @@ _NEMOTRON_SPEECH_MODEL_TYPES = ("nemo_speechlm",)
 _SPEECH_ENCODER_RECOMPILE_LIMIT = 64
 # A100 80GB + ~63GB weights: a 16-row grid left ~1.1 GiB for KV.
 _MAX_ENCODER_GRAPH_BATCH = 8
-# 80 ms / encoder frame; 16 kHz waveform; 256-frame graph buckets.
+# 80 ms / encoder frame; 256-frame graph buckets.
 _ENCODER_FRAME_HOP_S = 0.08
-_DEFAULT_SAMPLE_RATE = 16000
 _DEFAULT_FRAME_BUCKET = 256
-_DEFAULT_N_FEAT = 80
 _DEFAULT_MAX_WINDOWS = 2
-# Compile-specialize long audio without encoding every 256-frame step
-# up to a 3600 s cap (that would be ~176 full forwards).
-_WARMUP_LONG_DURATIONS_S = (30, 60, 120, 180, 240, 300, 600)
+_FEAT_ATTRS = (
+    "features",
+    "n_mels",
+    "nfilt",
+    "n_filt",
+    "num_features",
+    "n_features",
+    "feat_in",
+    "_feat_in",
+    "n_feat",
+)
 
 
 def is_nemo_speechlm_config(hf_config: object | None) -> bool:
@@ -767,10 +775,6 @@ def _audio_cap_frames() -> int:
     return max(1, int(duration_s / _ENCODER_FRAME_HOP_S))
 
 
-def _audio_cap_s() -> float:
-    return float(getattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 600) or 600)
-
-
 def _frame_bucket_step(runner: Any) -> int:
     bucket_fn = getattr(runner, "_frame_bucket", None)
     if callable(bucket_fn):
@@ -817,79 +821,103 @@ def speech_encoder_warmup_frame_buckets(runner: Any = None) -> list[int]:
     return buckets
 
 
-def _warmup_encode_durations_s(runner: Any = None) -> list[float]:
-    cap = _audio_cap_s()
-    durations = [3.2, 6.4, 10.24]
-    durations.extend(
-        bucket * _ENCODER_FRAME_HOP_S
-        for bucket in speech_encoder_warmup_frame_buckets(runner)
-    )
-    durations.extend(d for d in _WARMUP_LONG_DURATIONS_S if d <= cap)
-    if cap not in durations:
-        durations.append(cap)
-    seen: set[int] = set()
-    out: list[float] = []
-    for duration in durations:
-        if duration <= 0 or duration > cap:
+def _int_feat(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        n = int(value)
+        return n if n > 0 else None
+    return None
+
+
+def _feat_from_obj(obj: Any) -> int | None:
+    if obj is None:
+        return None
+    for name in _FEAT_ATTRS:
+        n = _int_feat(getattr(obj, name, None))
+        if n is not None:
+            return n
+    for cfg_name in ("cfg", "config", "_cfg"):
+        cfg = getattr(obj, cfg_name, None)
+        if cfg is None or cfg is obj:
             continue
-        key = int(round(duration * 1000))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(float(duration))
-    return out
+        n = _feat_from_obj(cfg)
+        if n is not None:
+            return n
+    return None
 
 
-def _model_device(model: Any) -> torch.device:
-    inner = unwrap_speech_encoder_model(model)
-    if isinstance(inner, nn.Module):
-        for param in inner.parameters():
-            return param.device
-    return torch.device("cpu")
+def speech_encoder_n_feat(model: Any = None, runner: Any = None) -> int | None:
+    """Mel / feat_in width from the perception preprocessor or encoder.
 
-
-def _dummy_waveform(
-    rows: int, duration_s: float, device: torch.device, dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor]:
-    samples = max(int(round(duration_s * _DEFAULT_SAMPLE_RATE)), 1)
-    audio = torch.zeros(rows, samples, device=device, dtype=dtype)
-    lengths = torch.full((rows,), samples, device=device, dtype=torch.int64)
-    return audio, lengths
-
-
-def _call_speech_encode(model: Any, audio: torch.Tensor, lengths: torch.Tensor) -> bool:
-    inner = unwrap_speech_encoder_model(model)
+    The plugin's ``_capture`` builds ``(batch, n_feat, n_frame)``. This
+    checkpoint's preprocessor emits 128 mels; a hardcoded 80-mel default
+    makes every warmup capture fail and then disables window graphs.
+    """
+    inner = unwrap_speech_encoder_model(model) if model is not None else None
     perception = getattr(inner, "perception", None)
-    if isinstance(perception, nn.Module):
-        forward = getattr(type(perception), "forward", None)
-        if forward is not None and forward is not nn.Module.forward:
-            perception(audio, lengths)
-            return True
-    for name in ("encode_audio", "process_audio", "_process_audio", "encode"):
-        fn = getattr(inner, name, None)
-        if callable(fn):
-            fn(audio, lengths)
-            return True
-    return False
+    encoder = getattr(perception, "encoder", None)
+    preprocessor = None
+    if perception is not None:
+        preprocessor = getattr(perception, "preprocessor", None) or getattr(
+            perception, "preproc", None
+        )
+    for obj in (
+        preprocessor,
+        getattr(preprocessor, "featurizer", None) if preprocessor is not None else None,
+        encoder,
+        runner,
+        getattr(runner, "encoder", None) if runner is not None else None,
+        getattr(runner, "preprocessor", None) if runner is not None else None,
+        perception,
+        inner,
+        getattr(inner, "hf_config", None) if inner is not None else None,
+    ):
+        n = _feat_from_obj(obj)
+        if n is not None:
+            return n
+        if obj is None:
+            continue
+        for child_name in ("preprocessor", "encoder"):
+            n = _feat_from_obj(getattr(obj, child_name, None))
+            if n is not None:
+                return n
+    return None
 
 
-def _warmup_graphs(runner: Any, model: Any) -> int:
+@dataclass
+class SpeechEncoderWarmupStats:
+    """Result of ``warmup_speech_encoder`` (graphs only; compile-only skips)."""
+
+    elapsed_s: float = 0.0
+    captured: int = 0
+    failed: int = 0
+
+
+def _warmup_graphs(runner: Any, model: Any) -> SpeechEncoderWarmupStats:
+    stats = SpeechEncoderWarmupStats()
     if runner is None or not getattr(runner, _RUNNER_PATCH_ATTR, False):
-        return 0
+        return stats
     if not getattr(runner, "_vllm_allow_capture", False):
-        return 0
+        return stats
     if getattr(runner, "pool", None) is None:
         with contextlib.suppress(Exception):
             runner.pool = torch.cuda.graph_pool_handle()
     inner = unwrap_speech_encoder_model(model)
+    n_feat = speech_encoder_n_feat(inner, runner)
+    if n_feat is None:
+        logger.error(
+            "Speech encoder warmup captured 0 graph(s): could not resolve "
+            "n_feat from perception.preprocessor features / encoder feat_in. "
+            "Refusing the 80-mel default (this checkpoint uses 128)."
+        )
+        stats.failed = 1
+        return stats
     dtype = _module_floating_dtype(inner if isinstance(inner, nn.Module) else model)
     if dtype is None:
         dtype = torch.float32
-    n_feat = int(
-        getattr(runner, "n_feat", None)
-        or getattr(runner, "feat_in", None)
-        or _DEFAULT_N_FEAT
-    )
     batches = [
         int(b)
         for b in (
@@ -897,67 +925,49 @@ def _warmup_graphs(runner: Any, model: Any) -> int:
             or default_speech_encoder_graph_batch_sizes()
         )
     ]
-    captured = 0
+    logger.info("Speech encoder warmup capturing with n_feat=%d", n_feat)
     for rows in batches:
         for frames in speech_encoder_warmup_frame_buckets(runner):
             if (rows, frames) in getattr(runner, "graphs", {}):
                 continue
             try:
                 _capture_one_graph(runner, rows, frames, n_feat, dtype)
-                captured += 1
+                stats.captured += 1
             except Exception as exc:
-                logger.warning(
-                    "Speech encoder warmup capture failed for %d rows x %d frames: %s",
+                stats.failed += 1
+                logger.error(
+                    "Speech encoder warmup capture failed for %d rows x %d "
+                    "frames (n_feat=%d): %s",
                     rows,
                     frames,
+                    n_feat,
                     exc,
                 )
-    return captured
+    if stats.captured == 0:
+        logger.error(
+            "Speech encoder warmup captured 0 graph(s) (%d failure(s)). "
+            "Window / long-audio graphs must not be disabled; check n_feat.",
+            stats.failed,
+        )
+    return stats
 
 
-def _warmup_encode(model: Any, runner: Any) -> int:
-    inner = unwrap_speech_encoder_model(model)
-    device = _model_device(inner)
-    dtype = _module_floating_dtype(inner if isinstance(inner, nn.Module) else model)
-    if dtype is None:
-        dtype = torch.float32
-    warmed = 0
-    batches = default_speech_encoder_graph_batch_sizes()
-    if runner is not None and getattr(runner, "batch_sizes", None):
-        batches = tuple(int(b) for b in runner.batch_sizes)
-    for duration_s in _warmup_encode_durations_s(runner):
-        for rows in batches:
-            audio, lengths = _dummy_waveform(rows, duration_s, device, dtype)
-            try:
-                if not _call_speech_encode(inner, audio, lengths):
-                    return warmed
-                warmed += 1
-            except Exception as exc:
-                logger.warning(
-                    "Speech encoder warmup encode failed for %d x %.1fs: %s",
-                    rows,
-                    duration_s,
-                    exc,
-                )
-                if warmed == 0:
-                    return 0
-    return warmed
-
-
-def warmup_speech_encoder(model: nn.Module | None) -> float:
-    """Compile and capture every warmup bucket after KV allocation.
+def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
+    """Capture graph buckets after KV. Compile-only does not dummy-encode.
 
     Under ``VLLM_BATCH_INVARIANT`` the grid is batch 1 × frame buckets
-    up to the audio cap (whole-forward graphs) plus a few long-audio
-    dummy encodes. Logs elapsed seconds. Must not run during memory
-    profiling.
+    up to ``min(runner.max_frames, audio cap)``. ``layer.compile``
+    already uses dynamic shapes, so compile-only skips this warmup
+    (186 dummy clips at a 3600 s cap took 293 s). Must not run during
+    memory profiling.
 
     Returns:
-        Warmup time in seconds (0 when there is nothing to warm).
+        Capture counts and elapsed seconds.
 
     """
+    stats = SpeechEncoderWarmupStats()
     if model is None:
-        return 0.0
+        return stats
     inner = unwrap_speech_encoder_model(model)
     runner = getattr(inner, "_encoder_graphs", None)
     want_graphs = (
@@ -965,43 +975,40 @@ def warmup_speech_encoder(model: nn.Module | None) -> float:
         and getattr(runner, _RUNNER_PATCH_ATTR, False)
         and getattr(runner, "_vllm_allow_capture", False)
     )
-    want_compile = False
-    if isinstance(inner, nn.Module):
-        want_compile = any(
-            getattr(layer, _COMPILED_ATTR, False)
-            for layer in collect_speech_encoder_layers(inner)
-        )
-    if not want_graphs and not want_compile:
-        return 0.0
+    if not want_graphs:
+        return stats
 
     started = time.perf_counter()
-    captured = 0
-    encoded = 0
     with torch.inference_mode():
-        if want_graphs:
-            captured = _warmup_graphs(runner, inner)
-        if want_compile:
-            encoded = _warmup_encode(inner, runner)
-    elapsed = time.perf_counter() - started
+        stats = _warmup_graphs(runner, inner)
+    stats.elapsed_s = time.perf_counter() - started
     logger.info(
-        "Speech encoder warmup finished in %.2f s "
-        "(captured %d graph(s), encoded %d dummy clip(s)).",
-        elapsed,
-        captured,
-        encoded,
+        "Speech encoder warmup finished in %.2f s (captured %d graph(s), "
+        "%d failure(s)).",
+        stats.elapsed_s,
+        stats.captured,
+        stats.failed,
     )
-    return elapsed
+    return stats
 
 
-def enable_speech_encoder_after_kv(model: nn.Module | None) -> None:
-    """Compile deferred layers, enable capture, and warm all buckets.
+def enable_speech_encoder_after_kv(model: nn.Module | None) -> SpeechEncoderWarmupStats:
+    """Compile deferred layers, enable capture, and warm graph buckets.
 
-    Runs after KV allocation so inductor workspaces and graph capture
-    are not counted as peak activation.
+    Pins ``default_dtype`` across compile + capture so dynamo does not
+    recompile on ``GLOBAL_STATE``. Runs after KV allocation so this is
+    not counted as peak activation. Compile-only skips dummy encodes.
     """
-    compile_pending_speech_encoder_layers(model)
-    enable_speech_encoder_graph_capture(model)
-    warmup_speech_encoder(model)
+    if model is None:
+        return SpeechEncoderWarmupStats()
+    inner = unwrap_speech_encoder_model(model)
+    dtype = None
+    if isinstance(inner, nn.Module):
+        dtype = _module_floating_dtype(inner)
+    with _pin_default_dtype(dtype):
+        compile_pending_speech_encoder_layers(model)
+        enable_speech_encoder_graph_capture(model)
+        return warmup_speech_encoder(model)
 
 
 def maybe_compile_speech_mm_encoder(

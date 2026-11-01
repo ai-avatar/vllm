@@ -181,8 +181,9 @@ in the decode or prefill batch.
   `encoder_cuda_graphs`) are equivalent; they stay off unless any of
   those three is set. Under BI the default graph batch grid is `(1,)`,
   compile and capture are deferred until after KV allocation, a post-KV
-  warmup compiles and captures batch-1 frame buckets, and the
-  path is a function of each item's valid length.
+  graph warmup captures batch-1 frame buckets (n_feat from the
+  preprocessor / encoder), and the path is a function of each item's
+  valid length.
 
 ### What you must disable (explicit errors, not silent)
 

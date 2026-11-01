@@ -103,10 +103,11 @@ the SpeechLM hf config. vLLM compiles `perception.encoder` blocks itself
 shorter than 128 encoder frames (10.24 s). The leftover
 `_use_flex_decoding` `Q < 128` guard is short-circuited so crossing
 128 frames does not recompile. Layer compile and graph capture are
-deferred until after KV allocation; a post-KV warmup then compiles
-and captures every `(batch, frame-bucket)` (under BI: batch 1 ×
-buckets up to the audio cap) with dummy audio so the first real
-request has no spike. Warmup time is logged and is not counted as
+deferred until after KV allocation; a post-KV graph warmup then
+captures every `(batch, frame-bucket)` (under BI: batch 1 × buckets
+up to the audio cap) using `n_feat` from the perception preprocessor
+/ encoder (`features` / `feat_in`, 128 mels here). Compile-only
+skips dummy-audio warmup. Warmup time is logged and is not counted as
 peak activation. Pending-compile state is stored on the unwrapped
 module (`model.unwrap()` / `.runnable`) because
 `CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.
