@@ -610,3 +610,88 @@ def test_mask_valid_tensor_updates_before_cuda_graph_replay():
     graph.replay()
     torch.accelerator.synchronize()
     assert int(out.item()) == 1513
+
+
+def test_call_long_1512_timestamp_flag_matches_plain():
+    """121 s (1512 frames): compiled encode False then True is bitwise equal."""
+    from vllm.compilation import mm_encoder as mm_encoder_mod
+    from vllm.compilation.mm_encoder import (
+        configure_speech_encoder_graphs,
+        enable_speech_encoder_graph_capture,
+    )
+
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    import vllm.envs as envs
+
+    envs.disable_envs_cache()
+    isolate_flex_attention_from_compile()
+    create_block_mask = _try_create_block_mask()
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=_ENCODER_WINDOW, max_windows=2, bucket_step=256
+    )
+    mm_encoder_mod._MASK_STATE.clear()
+    torch.manual_seed(12)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    block = _NeMoStyleFlexBlock().to(device=device, dtype=dtype)
+    block.compile(**speech_encoder_layer_compile_kwargs())
+    frames = 1512
+
+    class _LongRunner:
+        def __init__(self) -> None:
+            self.graphs = {(1, 550): object(), (1, 1650): object()}
+            self.batch_sizes = [1]
+            self.window = _ENCODER_WINDOW
+            self.max_windows = 2
+            self.max_frames = 4000
+            self.max_rows_x_frames = 4000
+            self.enabled = True
+            self.pool = None
+            self.feat_in = 64
+            self.flags: list[bool] = []
+            self._vllm_closed_shapes = True
+            self._vllm_allow_capture = True
+
+        def _capture_all(self, n_feat: int, dtype: torch.dtype) -> None:
+            return None
+
+        def _capture_or_disable(self, n_feat: int, dtype: torch.dtype) -> bool:
+            return True
+
+        def _frame_bucket(self, n: int) -> int:
+            return ((n + 255) // 256) * 256
+
+        def _split(self, rows: int, _frames: int) -> list[int]:
+            return [rows]
+
+        def _capture(self, *_args: object) -> None:
+            return None
+
+        def _call_short(self, processed, processed_len, return_ctc):
+            return self._call_long(processed, processed_len, return_ctc)
+
+        def _call_long(self, processed, processed_len, return_ctc):
+            self.flags.append(bool(return_ctc))
+            valid = int(processed_len.max().item())
+            x = processed[:, :, :valid].transpose(1, 2).contiguous()
+            return _encode_windows(block, x, create_block_mask), None
+
+        def __call__(self, audio_signal, audio_lengths, return_ctc=False):
+            return self._call_long(audio_signal, audio_lengths, return_ctc)
+
+    runner = _LongRunner()
+    model = nn.Module()
+    model._encoder_graphs = runner  # type: ignore[attr-defined]
+    configure_speech_encoder_graphs(model)
+    enable_speech_encoder_graph_capture(model)
+    processed = torch.randn(1, 64, frames, device=device, dtype=dtype)
+    processed_len = torch.tensor([frames], device=device)
+    with torch.inference_mode():
+        out_plain = runner._call_long(processed, processed_len, False)
+        out_ts = runner._call_long(processed, processed_len, True)
+    left = out_plain[0] if isinstance(out_plain, tuple) else out_plain
+    right = out_ts[0] if isinstance(out_ts, tuple) else out_ts
+    assert runner.flags == [False, False]
+    assert torch.equal(left, right)
+    mm_encoder_mod._MASK_STATE.clear()
+    envs.disable_envs_cache()

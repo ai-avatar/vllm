@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import sys
 import time
 import weakref
@@ -97,6 +98,7 @@ _LAST_ENCODER_PATH = ""
 _LAST_PROCESSED_SHAPE: tuple[int, ...] | None = None
 _LAST_PROCESSED_LEN: int | None = None
 _LAST_FLEX_INPUT: dict[str, Any] = {}
+_LAST_ENCODER_DECISION: dict[str, Any] = {}
 # Per-request valid length from create_block_mask / processed_len.
 # Must not leak across requests: _begin_encoder_mask resets it.
 _MASK_VALID_LEN: int | None = None
@@ -381,6 +383,76 @@ def _as_pos_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _serving_ctc_flag(requested: bool) -> bool:
+    """CTC extras are only for the post-transcription aligner.
+
+    The plugin's ``_call_long(..., True)`` / ``__call__(..., True)``
+    skips CUDA graphs or changes windowing/padding. A timestamps
+    request must still transcribe on the same compiled path as plain.
+    """
+    if not requested:
+        return False
+    if _ALIGNER_ACTIVE:
+        return True
+    return not _is_inference_mode()
+
+
+def _hash_encoder_result(result: Any) -> str | None:
+    tensor = result
+    if isinstance(result, tuple):
+        tensor = result[0] if result else None
+    if isinstance(tensor, list):
+        tensor = tensor[0] if tensor else None
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    cpu = tensor.detach().contiguous().float().cpu().view(torch.uint8).reshape(-1)
+    return hashlib.sha256(cpu.numpy().tobytes()).hexdigest()[:8]
+
+
+def _log_encoder_decision(
+    path: str,
+    processed: torch.Tensor,
+    processed_len: torch.Tensor,
+    *,
+    requested_ctc: bool,
+    serving_ctc: bool,
+    result: Any = None,
+) -> None:
+    valid = _processed_valid_len(processed, processed_len)
+    served = (
+        int(processed.shape[2])
+        if isinstance(processed, torch.Tensor) and processed.ndim >= 3
+        else None
+    )
+    bucket = speech_encoder_flex_bucket(served) if served else None
+    decision = {
+        "path": path,
+        "requested_ctc": bool(requested_ctc),
+        "serving_ctc": bool(serving_ctc),
+        "inference": _is_inference_mode(),
+        "aligner": _ALIGNER_ACTIVE,
+        "shape": (
+            tuple(int(s) for s in processed.shape)
+            if isinstance(processed, torch.Tensor)
+            else None
+        ),
+        "valid": valid,
+        "served": served,
+        "flex_bucket": bucket,
+        "mask": _LAST_FLEX_INPUT.get("block_mask_seq"),
+        "hash": _hash_encoder_result(result),
+    }
+    _LAST_ENCODER_DECISION.clear()
+    _LAST_ENCODER_DECISION.update(decision)
+    extra = (
+        f"path={path} requested_ctc={requested_ctc} serving_ctc={serving_ctc} "
+        f"inference={decision['inference']} aligner={decision['aligner']} "
+        f"shape={decision['shape']} valid={valid} served={served} "
+        f"flex_bucket={bucket} mask={decision['mask']} hash={decision['hash']}"
+    )
+    logger.info("Speech encoder path %s", extra)
 
 
 def _record_encoder_path(
@@ -1645,6 +1717,7 @@ def _wrap_speech_encoder_inference(model: Any) -> bool:
     def wrapped(*args: Any, **kwargs: Any):
         with _encoder_dtype_runtime(), _speech_encoder_runtime():
             args, kwargs = _promote_to_inference(args, kwargs)
+            args, kwargs = _force_serving_ctc_args(args, kwargs)
             _prime_mask_from_call_args(args, kwargs)
             if _ALIGNER_ACTIVE:
                 with _force_eager_compute():
@@ -1655,6 +1728,53 @@ def _wrap_speech_encoder_inference(model: Any) -> bool:
         wrapped = functools.update_wrapper(wrapped, orig)
     encoder.forward = wrapped
     setattr(encoder, _ENCODER_WRAP_ATTR, True)
+    _wrap_speech_perception_ctc(inner if inner is not None else model)
+    return True
+
+
+_PERCEPTION_WRAP_ATTR = "_vllm_speech_perception_ctc_wrapped"
+
+
+def _force_serving_ctc_args(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Drop CTC extras on the serving transcription pass."""
+    requested = bool(kwargs.get("return_ctc_timestamp_inputs", False))
+    if len(args) >= 3 and isinstance(args[2], bool):
+        requested = bool(args[2])
+    serving = _serving_ctc_flag(requested)
+    if serving == requested:
+        return args, kwargs
+    kwargs = dict(kwargs)
+    if "return_ctc_timestamp_inputs" in kwargs:
+        kwargs["return_ctc_timestamp_inputs"] = serving
+    if len(args) >= 3 and isinstance(args[2], bool):
+        args_list = list(args)
+        args_list[2] = serving
+        args = tuple(args_list)
+    return args, kwargs
+
+
+def _wrap_speech_perception_ctc(model: Any) -> bool:
+    """Force perception.forward onto the plain transcription path when serving."""
+    inner = unwrap_speech_encoder_model(model) if model is not None else None
+    if inner is None:
+        inner = model
+    perception = getattr(inner, "perception", None)
+    if perception is None or getattr(perception, _PERCEPTION_WRAP_ATTR, False):
+        return False
+    orig = getattr(perception, "forward", None)
+    if not callable(orig):
+        return False
+
+    def wrapped(*args: Any, **kwargs: Any):
+        args, kwargs = _force_serving_ctc_args(args, kwargs)
+        return orig(*args, **kwargs)
+
+    with contextlib.suppress(Exception):
+        wrapped = functools.update_wrapper(wrapped, orig)
+    perception.forward = wrapped
+    setattr(perception, _PERCEPTION_WRAP_ATTR, True)
     return True
 
 
@@ -1773,16 +1893,26 @@ def configure_speech_encoder_graphs(
     ):
         processed = _prepare_processed(processed, processed_len, runner, long=False)
         _record_encoder_path("short", processed, processed_len)
+        serving_ctc = _serving_ctc_flag(return_ctc_timestamp_inputs)
         # Timestamps add a CTC aligner *after* transcription. The
         # serving encode (inference_mode) must stay on the same
-        # compiled / graphed path as plain. Eager-route only the
-        # post-transcription aligner (not inference_mode).
-        if return_ctc_timestamp_inputs and not _is_inference_mode():
+        # compiled / graphed path as plain — pass False into the
+        # plugin so it cannot skip graphs / change padding.
+        if serving_ctc:
             with _aligner_runtime(), _force_eager_compute():
                 _prime_mask_from_processed(processed, processed_len)
-                return _disable_dynamo_fn(orig_call_short)(
-                    processed, processed_len, return_ctc_timestamp_inputs
+                result = _disable_dynamo_fn(orig_call_short)(
+                    processed, processed_len, True
                 )
+                _log_encoder_decision(
+                    "short",
+                    processed,
+                    processed_len,
+                    requested_ctc=return_ctc_timestamp_inputs,
+                    serving_ctc=True,
+                    result=result,
+                )
+                return result
         _prime_mask_from_processed(processed, processed_len)
         frames = processed.shape[2]
         bucket = runner._frame_bucket(frames)
@@ -1817,7 +1947,16 @@ def configure_speech_encoder_graphs(
                         runner.graphs.clear()
                         runner.enabled = False
                     raise SpeechEncoderGraphFallback(str(exc)) from exc
-        return orig_call_short(processed, processed_len, return_ctc_timestamp_inputs)
+        result = orig_call_short(processed, processed_len, False)
+        _log_encoder_decision(
+            "short",
+            processed,
+            processed_len,
+            requested_ctc=return_ctc_timestamp_inputs,
+            serving_ctc=False,
+            result=result,
+        )
+        return result
 
     def call_long(
         processed: torch.Tensor,
@@ -1828,14 +1967,33 @@ def configure_speech_encoder_graphs(
             processed = _prepare_processed(processed, processed_len, runner, long=True)
             _record_encoder_path("long", processed, processed_len)
             assert orig_call_long is not None
-            if return_ctc_timestamp_inputs and not _is_inference_mode():
+            serving_ctc = _serving_ctc_flag(return_ctc_timestamp_inputs)
+            if serving_ctc:
                 with _aligner_runtime(), _force_eager_compute():
                     _prime_mask_from_processed(processed, processed_len)
-                    return _disable_dynamo_fn(orig_call_long)(
-                        processed, processed_len, return_ctc_timestamp_inputs
+                    result = _disable_dynamo_fn(orig_call_long)(
+                        processed, processed_len, True
                     )
+                    _log_encoder_decision(
+                        "long",
+                        processed,
+                        processed_len,
+                        requested_ctc=return_ctc_timestamp_inputs,
+                        serving_ctc=True,
+                        result=result,
+                    )
+                    return result
             _prime_mask_from_processed(processed, processed_len)
-            return orig_call_long(processed, processed_len, return_ctc_timestamp_inputs)
+            result = orig_call_long(processed, processed_len, False)
+            _log_encoder_decision(
+                "long",
+                processed,
+                processed_len,
+                requested_ctc=return_ctc_timestamp_inputs,
+                serving_ctc=False,
+                result=result,
+            )
+            return result
 
     cls = type(runner)
     if not getattr(cls, "_vllm_speech_graph_call_wrapped", False):
@@ -1857,12 +2015,13 @@ def configure_speech_encoder_graphs(
             audio_signal, audio_lengths = _crop_to_valid_audio(
                 audio_signal, audio_lengths
             )
+            serving_ctc = _serving_ctc_flag(return_ctc_timestamp_inputs)
             try:
                 if (
                     envs.VLLM_BATCH_INVARIANT
                     and isinstance(audio_signal, torch.Tensor)
                     and audio_signal.shape[0] > 1
-                    and not return_ctc_timestamp_inputs
+                    and not serving_ctc
                 ):
                     return _call_graph_runner_per_item(
                         lambda audio, length, ctc: orig_cls_call(
@@ -1870,11 +2029,9 @@ def configure_speech_encoder_graphs(
                         ),
                         audio_signal,
                         audio_lengths,
-                        return_ctc_timestamp_inputs,
+                        False,
                     )
-                return orig_cls_call(
-                    self, audio_signal, audio_lengths, return_ctc_timestamp_inputs
-                )
+                return orig_cls_call(self, audio_signal, audio_lengths, serving_ctc)
             except SpeechEncoderGraphFallback:
                 return None
 

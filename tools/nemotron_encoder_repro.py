@@ -46,6 +46,28 @@ def _seconds_to_frames(seconds: float, hop_s: float) -> int:
     return max(int(round(seconds / hop_s)), 1)
 
 
+def _trim_to_common_valid(left, right, valid: int | None = None):
+    """Crop padded compiled output to the shared valid time length."""
+    if left is None or right is None:
+        return left, right
+    if tuple(left.shape) == tuple(right.shape) and valid is None:
+        return left, right
+    dims = min(left.ndim, right.ndim)
+    for dim in range(dims):
+        if left.shape[dim] == right.shape[dim] and (
+            valid is None or left.shape[dim] <= valid
+        ):
+            continue
+        n = min(int(left.shape[dim]), int(right.shape[dim]))
+        if valid is not None:
+            n = min(n, int(valid))
+        if n < left.shape[dim]:
+            left = left.narrow(dim, 0, n)
+        if n < right.shape[dim]:
+            right = right.narrow(dim, 0, n)
+    return left, right
+
+
 def _rel_err(left, right) -> float:
     scale = right.detach().float().abs().amax().clamp_min(1e-3)
     return float((left.float() - right.float()).abs().amax() / scale)
@@ -223,6 +245,7 @@ def _load_vllm_encoder(model: str, compile_mm: bool, gpu_memory_utilization: flo
             "cudagraph_mm_encoder": compile_mm,
         },
         enable_prefix_caching=False,
+        mm_processor_cache_gb=0,
     )
     engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
     vllm_config = getattr(engine, "vllm_config", None)
@@ -468,6 +491,34 @@ def _run_model(args: argparse.Namespace) -> int:
             print(f"  compiled T={t} FAIL: {exc}")
             traceback.print_exc()
 
+    runner = getattr(compiled_inner, "_encoder_graphs", None)
+    if runner is not None and hasattr(runner, "_call_long"):
+        t_long = 1512
+        print(f"compiled T={t_long} plain vs timestamps flag (must be bitwise)")
+        try:
+            torch.manual_seed(t_long)
+            processed = torch.randn(1, n_feat, t_long, device=device, dtype=dtype)
+            processed_len = torch.tensor([t_long], device=device, dtype=torch.int64)
+            with torch.inference_mode():
+                mm_encoder_mod._begin_encoder_mask(t_long)
+                plain = _first_tensor(
+                    runner._call_long(processed, processed_len, False)
+                )
+                ts = _first_tensor(runner._call_long(processed, processed_len, True))
+            plain, ts = _trim_to_common_valid(plain, ts, valid=t_long)
+            match = bool(torch.equal(plain, ts))
+            decision = dict(mm_encoder_mod._LAST_ENCODER_DECISION)
+            print(
+                f"  T={t_long} flag False vs True bitwise="
+                f"{'OK' if match else 'FAIL'} decision={decision}"
+            )
+            if not match:
+                failed += 1
+        except Exception as exc:
+            failed += 1
+            print(f"  T={t_long} flag compare FAIL: {exc}")
+            traceback.print_exc()
+
     if args.aligner:
         print("aligner-like: outside inference_mode, return_ctc_timestamp_inputs")
         runner = getattr(compiled_inner, "_encoder_graphs", None)
@@ -503,6 +554,7 @@ def _run_model(args: argparse.Namespace) -> int:
                     torch.manual_seed(t)
                     after = _first_tensor(encode(compiled_inner, t, inference=True))
                 before = _payload_to_tensor(compiled_out[t])
+                before, after = _trim_to_common_valid(before, after, valid=t)
                 match = bool(torch.equal(before, after))
                 print(f"  T={t} after-aligner bitwise={'OK' if match else 'FAIL'}")
                 if not match:
@@ -519,6 +571,7 @@ def _run_model(args: argparse.Namespace) -> int:
         try:
             left = _payload_to_tensor(compiled_out[t])
             eager_out = _payload_to_tensor(eager["outs"][str(t)])
+            left, eager_out = _trim_to_common_valid(left, eager_out, valid=t)
             rel = _rel_err(left, eager_out)
             mad = _max_abs(left, eager_out)
             ok = rel < 0.08
@@ -775,6 +828,19 @@ def _chunk_e2e_audio(seconds: float, wave, sr: int) -> list[tuple[float, Any]]:
     return parts
 
 
+def _clear_encoder_caches(llm) -> None:
+    """Force the next request to re-encode (no mm / encoder cache hits)."""
+    with contextlib.suppress(Exception):
+        llm.reset_mm_cache()
+    engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
+    if engine is None:
+        return
+    with contextlib.suppress(Exception):
+        engine.reset_mm_cache()
+    with contextlib.suppress(Exception):
+        engine.reset_encoder_cache()
+
+
 def _e2e_one_request(llm, wave, sr: int, sampling, *, mm_kwargs=None):
     messages = _nemotron_chat_messages(wave, sr)
     try:
@@ -798,6 +864,7 @@ def _e2e_one_request(llm, wave, sr: int, sampling, *, mm_kwargs=None):
 
 
 def _e2e_clip_request(llm, chunks, sr: int, *, timestamps: bool, max_tokens: int):
+    from vllm.compilation import mm_encoder as mm_encoder_mod
     from vllm.sampling_params import SamplingParams
 
     if timestamps:
@@ -814,9 +881,25 @@ def _e2e_clip_request(llm, chunks, sr: int, *, timestamps: bool, max_tokens: int
         sampling = SamplingParams(temperature=0.0, max_tokens=max_tokens)
         mm_kwargs = None
     texts = []
+    decisions = []
     for _chunk_s, piece in chunks:
+        _clear_encoder_caches(llm)
+        mm_encoder_mod._LAST_ENCODER_DECISION.clear()
         outs = _e2e_one_request(llm, piece, sr, sampling, mm_kwargs=mm_kwargs)
         texts.append(_print_output_text(outs))
+        decision = dict(mm_encoder_mod._LAST_ENCODER_DECISION)
+        decisions.append(decision)
+        if decision:
+            print(
+                f"    path={decision.get('path')} "
+                f"requested_ctc={decision.get('requested_ctc')} "
+                f"serving_ctc={decision.get('serving_ctc')} "
+                f"valid={decision.get('valid')} served={decision.get('served')} "
+                f"flex_bucket={decision.get('flex_bucket')} "
+                f"hash={decision.get('hash')}"
+            )
+        else:
+            print("    path=<?> (no encoder decision; cache not cleared?)")
     return " ".join(part for part in texts if part)
 
 
@@ -838,6 +921,7 @@ def _run_e2e(args: argparse.Namespace) -> int:
             "cudagraph_mm_encoder": True,
         },
         enable_prefix_caching=False,
+        mm_processor_cache_gb=0,
     )
     embed_hashes = _install_embed_hash_probe(llm)
     after_load = _unique_graphs()

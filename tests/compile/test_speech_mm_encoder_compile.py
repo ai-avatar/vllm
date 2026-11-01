@@ -1353,9 +1353,11 @@ def test_timestamp_flag_in_inference_mode_stays_on_graph_path(
     entered: list[bool] = []
 
     orig_long = runner._call_long
+    flags: list[bool] = []
 
     def tracking_long(processed, processed_len, return_ctc_timestamp_inputs):
         entered.append(mm_encoder_mod._ALIGNER_ACTIVE)
+        flags.append(return_ctc_timestamp_inputs)
         return orig_long(processed, processed_len, return_ctc_timestamp_inputs)
 
     runner._call_long = tracking_long  # type: ignore[method-assign]
@@ -1368,6 +1370,38 @@ def test_timestamp_flag_in_inference_mode_stays_on_graph_path(
         runner._call_long(processed, processed_len, True)
         runner._call_long(processed, processed_len, False)
     assert entered == [False, False]
+    assert flags == [False, False]
+    envs.disable_envs_cache()
+
+
+def test_call_long_1512_drops_ctc_flag_in_inference_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """T=1512 (121 s long path) must pass False into the plugin when serving."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    envs.disable_envs_cache()
+    model = _SpeechModel()
+    runner = _FakeGraphRunner()
+    flags: list[bool] = []
+    orig_long = runner._call_long
+
+    def tracking_long(processed, processed_len, return_ctc_timestamp_inputs):
+        flags.append(return_ctc_timestamp_inputs)
+        return orig_long(processed, processed_len, return_ctc_timestamp_inputs)
+
+    runner._call_long = tracking_long  # type: ignore[method-assign]
+    model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=False, graphs=True))
+    enable_speech_encoder_graph_capture(model)
+    processed = torch.zeros(1, 128, 1512)
+    processed_len = torch.tensor([1512])
+    with torch.inference_mode():
+        runner._call_long(processed, processed_len, False)
+        runner._call_long(processed, processed_len, True)
+    assert flags == [False, False]
+    assert mm_encoder_mod._LAST_ENCODER_DECISION.get("path") == "long"
+    assert mm_encoder_mod._LAST_ENCODER_DECISION.get("serving_ctc") is False
+    assert mm_encoder_mod._LAST_ENCODER_DECISION.get("requested_ctc") is True
     envs.disable_envs_cache()
 
 
