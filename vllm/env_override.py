@@ -982,3 +982,11 @@ if os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower() in (
     )
 
     _install_force_first_config()
+
+# Count inductor CachingAutotuner runtime benchmarks (class-level wrap;
+# do not replace AutotuneCache.save, which is pickled into static autotuners).
+from vllm.compilation.inductor_autotune_guard import (  # noqa: E402
+    install as _install_inductor_autotune_guard,
+)
+
+_install_inductor_autotune_guard()

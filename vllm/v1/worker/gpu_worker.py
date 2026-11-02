@@ -906,6 +906,11 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        from vllm.compilation import inductor_autotune_guard, inductor_autotune_pin
+
+        inductor_autotune_guard.install()
+        inductor_autotune_guard.reset()
+
         warmup_sizes: list[int] = []
 
         if (
@@ -1072,6 +1077,9 @@ class Worker(WorkerBase):
             )
 
             trigger_inductor_lazy_init(self.device)
+
+        inductor_autotune_pin.maybe_dump_pinned_autotune_cache()
+        inductor_autotune_guard.check_inductor_runtime_benchmarks()
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.

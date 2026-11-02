@@ -301,6 +301,9 @@ if TYPE_CHECKING:
     VLLM_DEBUG_DUMP_PATH: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
+    VLLM_INDUCTOR_AUTOTUNE_PIN_DIR: str | None = None
+    VLLM_INDUCTOR_AUTOTUNE_PIN_DUMP: str | None = None
+    VLLM_INDUCTOR_AUTOTUNE_ALLOW_BENCH: bool = False
     VLLM_USE_NCCL_SYMM_MEM: bool = False
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_GC_DEBUG: str = ""
@@ -2120,6 +2123,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING": lambda: bool(
         int(os.getenv("VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING", "1"))
     ),
+    # Directory of a GPU-SKU pin pack of inductor AutotuneCache
+    # ``*.best_config`` files. Loaded into TORCHINDUCTOR_CACHE_DIR before
+    # kernel precompile so multi-config kernels hit the cache instead of
+    # re-timing. Unset: packaged pins, then
+    # $VLLM_CACHE_ROOT/inductor_autotune_pins/<sku>/.
+    "VLLM_INDUCTOR_AUTOTUNE_PIN_DIR": lambda: os.getenv(
+        "VLLM_INDUCTOR_AUTOTUNE_PIN_DIR", None
+    ),
+    # After warmup, dump inductor ``*.best_config`` files into a pin pack.
+    # ``1``/``true`` writes to VLLM_INDUCTOR_AUTOTUNE_PIN_DIR or
+    # $VLLM_CACHE_ROOT/inductor_autotune_pins/<sku>/. Any other non-empty
+    # value is used as the destination path.
+    "VLLM_INDUCTOR_AUTOTUNE_PIN_DUMP": lambda: os.getenv(
+        "VLLM_INDUCTOR_AUTOTUNE_PIN_DUMP", None
+    ),
+    # Allow inductor runtime autotune after artifact load even under
+    # VLLM_BATCH_INVARIANT (needed while generating a pin pack). Default off.
+    "VLLM_INDUCTOR_AUTOTUNE_ALLOW_BENCH": lambda: parse_env_bool(
+        "VLLM_INDUCTOR_AUTOTUNE_ALLOW_BENCH"
+    ),
     # Flag to enable NCCL symmetric memory allocation and registration
     "VLLM_USE_NCCL_SYMM_MEM": lambda: bool(
         int(os.getenv("VLLM_USE_NCCL_SYMM_MEM", "0"))
@@ -2425,6 +2448,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
+        "VLLM_INDUCTOR_AUTOTUNE_PIN_DIR",
+        "VLLM_INDUCTOR_AUTOTUNE_PIN_DUMP",
+        "VLLM_INDUCTOR_AUTOTUNE_ALLOW_BENCH",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
