@@ -32,9 +32,11 @@ vllm serve <nemotron-transcribe> --hf-overrides '{"encoder_compile": true}'
 
 In-tree vision encoders compile through `@support_torch_compile`. The NeMo
 SpeechLM `perception.encoder` transformer blocks (including Sortformer when
-the plugin mounts it there) are compiled after load with dynamic shapes so
-variable audio lengths do not re-specialize. Flex stays in the compiled
-graph with `FORCE_USE_FLEX_ATTENTION` so short clips do not take
+the plugin mounts it there) are compiled after load. Flex q/k/v and
+`create_block_mask` pad onto a closed bucket set (256-frame whole-forward
+tiles and `window` for last-window remainders) and NeMo's flex wrapper is
+compiled with `dynamic=False` so variable chunk lengths do not
+re-specialize. `FORCE_USE_FLEX_ATTENTION` keeps short clips off
 flex-decoding. The projector / `modality_adapter` stay eager.
 
 ## How Compilation Works for Multimodal Components
@@ -106,15 +108,49 @@ shorter than 128 encoder frames (10.24 s). The leftover
 deferred until after KV allocation; a post-KV graph warmup then
 captures every `(batch, frame-bucket)` (under BI: batch 1 × buckets
 up to the audio cap) using `n_feat` from the perception preprocessor
-/ encoder (`features` / `feat_in`, 128 mels here), then long-audio
-window graphs (3-window dummy plus window-count / last-width
-variants). Compile-only skips dummy-audio warmup. Warmup time is
+/ encoder (`features` / `feat_in`, 128 mels here), then one
+long-audio `3 * window` dummy. The plugin still windows by
+`processed_len`, so last-window T is `valid % window`; flex q/k/v
+and the block mask pad to `window` (or the next 256-bucket).
+`mask_mod` reads the valid length from a tensor (not a Python int);
+that tensor is written before each call and before CUDA-graph replay
+(never baked during capture). `create_block_mask` keeps the caller's
+seq_lengths; the flex wrapper always pads q/k/v to the bucket and
+builds a matching mask. The flex pad wrapper is `torch.compiler.disable`'d (recursive) so
+dynamo cannot trace pad / `set_stance` / mask into a compiled
+layer; q/k/v are `.contiguous()` before the compiled flex call.
+Every encoder forward pins `default_dtype` to the compile-time
+model dtype so request-time `GLOBAL_STATE` cannot recompile the
+layers (warmup used to restore float32). The post-warmup recompile
+watch inspects only the `CodeType` dynamo is compiling
+(`convert_frame._compile`'s `code` filename), so LM CUDA-graph
+capture (`activation.forward_native`, `grouped_topk`) is silent.
+The timestamp aligner is
+`torch.compiler.disable`'d so it cannot add unique_graphs. It uses
+an isolated BlockMask / valid-length cache. Graph runners set
+`ctc_timestamp_inputs` so a timestamps request replays the same
+graphs as plain and still returns `(embeddings, states)`. Compile-off
+does not wrap `perception.forward` or rewrite that arity. A
+profile dummy with `window=max_frames` (e.g. 4000) does not pad a
+500-frame slice to 4000. Long warmup includes a last-window
+remainder (not only `3 * window` full-valid) so the first real
+121 s / 1512-frame encode is not a first-invocation compile, and
+also the `(1, n_feat, 3 * max_frames)` dummy `profile_run` still
+forwards.
+Flex is compiled with `dynamic=False` so
+those remainders cannot recompile. Compile-only skips dummy-audio warmup. Warmup time is
 logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped
 module (`model.unwrap()` / `.runnable`) because
 `CUDAGraphWrapper.__getattr__` forwards but `delattr` does not.
-Capture of a missing bucket after warmup is still lazy. Under
-`VLLM_BATCH_INVARIANT=1` the default batch grid is `(1,)` and the
-replay path is a function of each item's valid length.
+After warmup, serving-time capture is off. Under
+`VLLM_BATCH_INVARIANT=1` the default batch grid is `(1,)`, the
+replay path is a function of each item's valid length, inductor
+timing autotune is disabled (`deterministic=True`) for
+`layer.compile` and NeMo's import-time compiled flex wrapper, and
+served tensors stay on the warmed shape set so later traffic cannot
+change encoder numerics. `TORCH_LOGS=recompiles,guards` plus the
+post-warmup recompile warning print the last path, processed
+shape/len, and flex q shape/stride/block-mask.
 
 ```bash
 VLLM_BATCH_INVARIANT=1 VLLM_USE_V2_MODEL_RUNNER=0 \
