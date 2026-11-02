@@ -82,7 +82,60 @@ def test_nemotron_shapes_are_in_ampere_table():
         smem = (
             cfg.num_stages * 2 * (cfg.block_m * cfg.block_k + cfg.block_k * cfg.block_n)
         )
-        assert smem <= 160000, f"{name} seed config exceeds A100 smem ({smem})"
+        assert smem <= 160000, f"{name} Ampere tile exceeds A100 smem ({smem})"
+
+
+# A100 --quick sweep winners from ampere_bi_matmul_best.py (M {1,2,4..512}).
+_A100_QUICK_SWEEP_AMPERE = {
+    (128, 2688): (32, 32, 128, 4, 3),
+    (1856, 2688): (32, 64, 128, 4, 3),
+    (2688, 1856): (32, 128, 128, 4, 3),
+    (2688, 3712): (32, 128, 128, 4, 3),
+    (2688, 4096): (32, 128, 128, 4, 3),
+    (2688, 5376): (64, 64, 128, 8, 3),
+    (3712, 2688): (32, 128, 128, 8, 3),
+    (4608, 2688): (32, 128, 128, 8, 3),
+    (10304, 2688): (64, 128, 128, 8, 3),
+    (131072, 2688): (64, 256, 64, 8, 3),
+}
+
+
+@pytest.mark.cpu_test
+def test_ampere_table_matches_a100_quick_sweep():
+    table = _BATCH_INVARIANT_MATMUL_STATIC_CONFIGS["ampere"]
+    assert set(table) == set(_A100_QUICK_SWEEP_AMPERE)
+    for nk, expected in _A100_QUICK_SWEEP_AMPERE.items():
+        cfg = table[nk]
+        assert (
+            cfg.block_m,
+            cfg.block_n,
+            cfg.block_k,
+            cfg.num_warps,
+            cfg.num_stages,
+        ) == expected, nk
+    # Heuristic seed tiles (block_k 64) changed numerics; none may remain.
+    seed_ampere = {
+        (131072, 2688): (32, 128, 64, 8, 3),
+        (4608, 2688): (64, 128, 64, 8, 3),
+        (2688, 4096): (64, 128, 64, 8, 3),
+        (1856, 2688): (64, 128, 64, 8, 3),
+        (2688, 1856): (64, 64, 64, 8, 3),
+        (3712, 2688): (64, 128, 64, 8, 3),
+        (2688, 3712): (64, 128, 64, 8, 3),
+        (128, 2688): (64, 32, 64, 4, 3),
+        (10304, 2688): (64, 128, 64, 8, 3),
+        (2688, 5376): (64, 128, 64, 8, 3),
+    }
+    for nk, seed in seed_ampere.items():
+        cfg = table[nk]
+        actual = (
+            cfg.block_m,
+            cfg.block_n,
+            cfg.block_k,
+            cfg.num_warps,
+            cfg.num_stages,
+        )
+        assert actual != seed, f"{nk} still using seed tile {seed}"
 
 
 @pytest.mark.cpu_test
