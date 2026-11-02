@@ -3,6 +3,7 @@
 """CPU tests for SpeechLM / Nemotron Transcribe encoder compile wiring."""
 
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -20,16 +21,21 @@ from vllm.compilation.mm_encoder import (
     default_speech_encoder_graph_batch_sizes,
     enable_speech_encoder_after_kv,
     enable_speech_encoder_graph_capture,
+    guard_speech_flex_attention,
+    install_speech_flex_eager_hop_guard,
     is_nemo_speechlm_config,
     isolate_flex_attention_from_compile,
     maybe_compile_speech_mm_encoder,
+    should_guard_speech_flex,
     speech_encoder_layer_compile_kwargs,
     speech_encoder_n_feat,
     speech_encoder_warmup_frame_buckets,
     speech_encoder_warmup_long_frames,
+    speech_flex_eager_hop_compile_count,
     sync_mm_encoder_compile_flags,
     unwrap_speech_encoder_model,
     warmup_speech_encoder,
+    warmup_speech_flex_variants,
 )
 from vllm.config import CUDAGraphMode
 from vllm.config.compilation import CompilationConfig
@@ -230,6 +236,58 @@ def test_maybe_compile_is_noop_when_disabled():
     assert encoder.layers[0].compile_calls == 0
     assert encoder.layers[0].inner.layers[0].compile_calls == 0
     assert model.perception.modality_adapter.layers[0].compile_calls == 0
+    assert not should_guard_speech_flex(model, _vllm_config(compile_mm=False))
+
+
+def test_speech_compile_off_still_guards_flex(monkeypatch: pytest.MonkeyPatch):
+    called = {"iso": 0, "dyn": 0, "hop": 0}
+
+    def mark_iso() -> bool:
+        called["iso"] += 1
+        return True
+
+    def mark_dyn() -> None:
+        called["dyn"] += 1
+
+    def mark_hop() -> None:
+        called["hop"] += 1
+
+    monkeypatch.setattr(mm_encoder_mod, "isolate_flex_attention_from_compile", mark_iso)
+    monkeypatch.setattr(mm_encoder_mod, "configure_speech_encoder_dynamo", mark_dyn)
+    monkeypatch.setattr(mm_encoder_mod, "install_speech_flex_eager_hop_guard", mark_hop)
+    model = _SpeechModel()
+    compiled = maybe_compile_speech_mm_encoder(
+        model, _vllm_config(compile_mm=False, hf=_speech_hf())
+    )
+    assert compiled == 0
+    assert model.perception.encoder.layers[0].compile_calls == 0
+    assert called["iso"] >= 1
+    assert called["dyn"] >= 1
+    assert called["hop"] >= 1
+    assert should_guard_speech_flex(model, _vllm_config(hf=_speech_hf()))
+
+
+def test_non_speech_compile_off_does_not_guard_flex(monkeypatch: pytest.MonkeyPatch):
+    called = {"iso": 0, "dyn": 0}
+
+    def boom_iso():
+        called["iso"] += 1
+        raise AssertionError("non-Nemotron compile-off must not isolate flex")
+
+    def boom_dyn():
+        called["dyn"] += 1
+        raise AssertionError("non-Nemotron compile-off must not raise dynamo limits")
+
+    monkeypatch.setattr(mm_encoder_mod, "isolate_flex_attention_from_compile", boom_iso)
+    monkeypatch.setattr(mm_encoder_mod, "configure_speech_encoder_dynamo", boom_dyn)
+    model = nn.Linear(4, 4)
+    hf = SimpleNamespace(model_type="llama", architectures=["LlamaForCausalLM"])
+    compiled = maybe_compile_speech_mm_encoder(
+        model, _vllm_config(compile_mm=False, hf=hf)
+    )
+    assert compiled == 0
+    assert called == {"iso": 0, "dyn": 0}
+    assert not should_guard_speech_flex(model, _vllm_config(compile_mm=False, hf=hf))
 
 
 def test_maybe_compile_skips_adapter_and_nested_layers():
@@ -430,6 +488,88 @@ def test_dynamo_recompile_limit_is_raised():
     config = torch._dynamo.config
     limit = getattr(config, "recompile_limit", getattr(config, "cache_size_limit", 0))
     assert limit >= 64
+    entries = getattr(config, "_config", None)
+    if isinstance(entries, dict) and "recompile_limit" in entries:
+        default = getattr(entries["recompile_limit"], "default", None)
+        assert isinstance(default, int)
+        assert default >= 64
+    seen: dict[str, int] = {}
+
+    def other_thread() -> None:
+        seen["limit"] = int(torch._dynamo.config.recompile_limit)
+
+    thread = threading.Thread(target=other_thread)
+    thread.start()
+    thread.join()
+    assert seen["limit"] >= 64
+
+
+def test_flex_wrapper_normalizes_runtime_guards():
+    recorded: dict[str, object] = {}
+
+    def fake_flex(query, *args, **kwargs):
+        recorded["dtype"] = torch.get_default_dtype()
+        recorded["inference"] = torch.is_inference_mode_enabled()
+        recorded["opts"] = dict(kwargs.get("kernel_options") or {})
+        return query
+
+    wrapped = mm_encoder_mod._force_flex_attention_kernel(fake_flex)
+    query = torch.zeros(1, 1, 4, 4, dtype=torch.float32)
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        with torch.enable_grad():
+            wrapped(query)
+        opts = recorded["opts"]
+        assert recorded["dtype"] == torch.float32
+        assert recorded["inference"] is True
+        assert isinstance(opts, dict)
+        assert opts["FORCE_USE_FLEX_ATTENTION"] is True
+        assert torch.get_default_dtype() == torch.float64
+        assert not torch.is_inference_mode_enabled()
+    finally:
+        torch.set_default_dtype(prev)
+
+
+def test_eager_hop_wrapper_compile_is_counted():
+    install_speech_flex_eager_hop_guard()
+    before = speech_flex_eager_hop_compile_count()
+
+    def _flex_attention_hop_wrapper(*args, **kwargs):
+        return args
+
+    torch.compile(_flex_attention_hop_wrapper, backend="eager", fullgraph=True)
+    assert speech_flex_eager_hop_compile_count() == before + 1
+
+    def other():
+        return None
+
+    torch.compile(other, backend="eager")
+    assert speech_flex_eager_hop_compile_count() == before + 1
+
+
+def test_flex_variant_warmup_skipped_without_cuda():
+    model = _SpeechModel()
+    assert warmup_speech_flex_variants(model) == 0
+    stats = enable_speech_encoder_after_kv(model)
+    assert stats.flex_warmed == 0
+    assert stats.captured == 0
+
+
+def test_after_kv_warms_flex_on_speech_compile_off(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(mm_encoder_mod, "warmup_speech_flex_variants", lambda model: 8)
+    model = _SpeechModel()
+    model.hf_config = _speech_hf()  # type: ignore[attr-defined]
+    stats = enable_speech_encoder_after_kv(model)
+    assert stats.flex_warmed == 8
+    assert stats.captured == 0
+
+
+def test_guard_speech_flex_attention_is_idempotent():
+    guard_speech_flex_attention()
+    guard_speech_flex_attention()
+    configure_speech_encoder_dynamo()
+    assert torch._dynamo.config.recompile_limit >= 64
 
 
 class _FakeGraphRunner:
