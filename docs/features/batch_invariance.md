@@ -260,7 +260,8 @@ Kernel tests (GPU when present; CPU covers the config / backend checks):
   tests/v1/determinism/test_mamba2_moe_batch_invariant.py \
   tests/v1/determinism/test_mamba2_bi_scheduler.py \
   tests/v1/determinism/test_mm_encoder_batch_invariant.py \
-  tests/v1/determinism/test_gate_linear_batch_invariant.py -v
+  tests/v1/determinism/test_gate_linear_batch_invariant.py \
+  tests/v1/determinism/test_ampere_matmul_static_config.py -v
 ```
 
 ### Speed cost (A100 BF16 Nemotron 3.5 Transcribe, measured)
@@ -294,8 +295,17 @@ When batch invariance is enabled, vLLM:
 4. Under tensor parallelism, keeps custom all-reduce on with a fixed reduction order (the 1-stage kernel is pinned, and large inputs are reduced in fixed-size chunks), and disables FlashInfer, AITER and QuickReduce all-reduce
 5. On CUDA devices with tuned matmul table entries for the model's bf16 unquantized forward linear layers (Ada, Hopper, Blackwell),
    runs without `torch.compile` using breakable CUDA graphs so tile configs follow the runtime batch size; set `VLLM_USE_BREAKABLE_CUDAGRAPH=0` to opt out.
-6. Splits the LoRA shrink reduction into 8 fixed K chunks that are summed in a fixed order instead of with atomics
-7. For Mamba2, pins SSD Triton tiles and the decode SSU launch config so they
+6. On Ampere (sm80 / A100), Nemotron 3.5 Transcribe BF16 persistent-matmul
+   tiles are keyed only on `(N, K)` and never on `M`, so a request that runs
+   alone and the same row in a concurrent batch share one kernel config. The
+   table in `_BATCH_INVARIANT_MATMUL_STATIC_CONFIGS["ampere"]` is the A100
+   `--quick` sweep
+   (`benchmarks/kernels/tune_ampere_batch_invariant_matmul.py`; 252/252
+   candidates BI-ok). Unmatched shapes keep the generic 128×128×64 default.
+   This does not enable breakable CUDA graphs (those exist for M-bucketed
+   Ada/Hopper/Blackwell tables).
+7. Splits the LoRA shrink reduction into 8 fixed K chunks that are summed in a fixed order instead of with atomics
+8. For Mamba2, pins SSD Triton tiles and the decode SSU launch config so they
    no longer depend on token count or `effective_batch`. FlashInfer SSU,
    ReplaySSM, and Mamba stochastic rounding are rejected rather than ignored.
    Prefill splits are aligned to the Mamba chunk size. Multimodal encoder
