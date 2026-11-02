@@ -181,8 +181,10 @@ in the decode or prefill batch.
   `encoder_cuda_graphs`) are equivalent; they stay off unless any of
   those three is set. Under BI the default graph batch grid is `(1,)`,
   compile and capture are deferred until after KV allocation, a post-KV
-  graph warmup captures batch-1 frame buckets and one long-audio
-  `3 * window` dummy (n_feat from the preprocessor / encoder). Flex
+  graph warmup captures batch-1 frame buckets, a long-audio
+  `3 * window` dummy, and a last-window remainder (each twice) so
+  the first real 121 s / 1512-frame encode matches later ones
+  (n_feat from the preprocessor / encoder). Flex
   q/k/v and `create_block_mask` pad last-window remainders
   (`valid % window` from the plugin) onto that closed set.
   `mask_mod` reads valid length from a tensor (written before each

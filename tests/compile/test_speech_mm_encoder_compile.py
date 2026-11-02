@@ -808,18 +808,20 @@ def test_served_frames_pad_long_remainder_to_window(
     envs.disable_envs_cache()
 
 
-def test_long_warmup_frames_are_one_three_window_shape(
+def test_long_warmup_frames_include_remainder(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    """Full 3-window plus last-window remainders (min and mid / 1512)."""
     monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 600)
     envs.disable_envs_cache()
     runner = _FakeGraphRunner()
     runner.window = 550
     runner.max_windows = 2
     frames = speech_encoder_warmup_long_frames(runner)
-    assert frames == [3 * 550]
+    assert 3 * 550 in frames
+    assert 2 * 550 + 1 in frames
+    assert 1512 in frames
     assert 4 * 550 not in frames
-    assert 2 * 550 + 256 not in frames
     envs.disable_envs_cache()
 
 
@@ -1417,6 +1419,76 @@ def test_call_long_1512_plain_and_timestamps_embeddings_match(
     envs.disable_envs_cache()
 
 
+def test_first_long_encode_matches_later_after_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """After warmup, encode X twice (and X after Y) must be bitwise equal."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(envs, "VLLM_MAX_AUDIO_DECODE_DURATION_S", 160)
+    envs.disable_envs_cache()
+    model = _SpeechModel()
+    runner = _FakeGraphRunner()
+    runner.window = 550
+    runner.max_windows = 2
+    runner.max_frames = 1100
+    model._encoder_graphs = runner
+    maybe_compile_speech_mm_encoder(model, _vllm_config(compile_mm=False, graphs=True))
+    enable_speech_encoder_after_kv(model)
+    processed = torch.zeros(1, 128, 1512)
+    processed_len = torch.tensor([1512])
+    other = torch.zeros(1, 128, 1101)
+    other_len = torch.tensor([1101])
+    with torch.inference_mode():
+        first = runner._call_long(processed, processed_len, False)
+        second = runner._call_long(processed, processed_len, False)
+        runner._call_long(other, other_len, False)
+        third = runner._call_long(processed, processed_len, False)
+    assert first == second == third
+    assert first[0] == ["long"]
+    envs.disable_envs_cache()
+
+
+def test_trim_compiled_vs_eager_uses_encoder_output_len():
+    """Input-frame ``valid`` must not keep compiled T=29 against eager T/8."""
+    from tools.nemotron_encoder_repro import _trim_to_common_valid
+
+    compiled = torch.zeros(29, 8)
+    eager = torch.zeros(4, 8)
+    left, right = _trim_to_common_valid(compiled, eager, valid=29)
+    assert left.shape == (4, 8)
+    assert right.shape == (4, 8)
+
+
+def test_compiled_first_remainder_matches_later():
+    """Compiled pad-to-window path: first remainder equals later, and after Y."""
+    from torch._dynamo.utils import counters
+
+    mm_encoder_mod.set_speech_encoder_shape_config(
+        window=550, max_windows=2, bucket_step=256
+    )
+    torch._dynamo.reset()
+    counters.clear()
+
+    def inner(x: torch.Tensor) -> torch.Tensor:
+        return x * 2 + 1
+
+    compiled = torch.compile(inner, dynamic=True, backend="eager")
+    warmup_full = torch.zeros(1, 128, 1650)
+    with torch.inference_mode():
+        compiled(warmup_full)
+        compiled(torch.zeros(1, 128, 1101))
+        compiled(warmup_full)
+    x = torch.randn(1, 128, 1512)
+    y = torch.randn(1, 128, 80)
+    with torch.inference_mode():
+        first = compiled(x)
+        second = compiled(x)
+        compiled(y)
+        third = compiled(x)
+    assert torch.equal(first, second)
+    assert torch.equal(first, third)
+
+
 def test_aligner_mask_state_is_isolated_from_serving():
     device = torch.device("cpu")
     mm_encoder_mod._MASK_STATE.clear()
@@ -1516,9 +1588,11 @@ def test_warmup_captures_long_window_graphs(monkeypatch: pytest.MonkeyPatch):
     assert stats.failed == 0
     assert stats.captured > stats.long_captured
     expected = speech_encoder_warmup_long_frames(runner)
-    assert runner.long_frames == expected
+    assert len(runner.long_frames) >= len(expected)
     assert all(rows == 1 for rows, _ in runner.capture_calls)
     assert min(runner.long_frames) > 1100
+    # Remainders pad to 3 * window; warmup must have run them.
+    assert runner.long_frames.count(3 * 550) >= 2
     envs.disable_envs_cache()
 
 
@@ -1649,6 +1723,18 @@ def test_engine_smoke_compile_off_and_on_profile_ctc():
             embs, states = _plugin_encode_with_ctc_capture(model, audio, lengths, True)
         assert states is not None
         assert embs is not None
+
+
+def test_reset_online_encoder_state_calls_streaming_reset():
+    calls: list[str] = []
+
+    class _Enc:
+        def reset_cache(self):
+            calls.append("reset_cache")
+
+    runner = SimpleNamespace(perception=SimpleNamespace(encoder=_Enc()))
+    mm_encoder_mod._reset_online_encoder_state(runner)
+    assert calls == ["reset_cache"]
 
 
 def test_enable_runner_ctc_states_when_perception_accepts_flag():

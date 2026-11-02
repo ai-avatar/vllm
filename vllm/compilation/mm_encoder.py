@@ -42,8 +42,10 @@ function of each item's valid length, not the padded tensor width.
 Layer compile is also deferred until after KV so inductor workspaces are
 not counted as peak activation. A post-KV graph warmup then captures
 every (batch, frame-bucket) using ``n_feat`` from the perception
-preprocessor / encoder, then one long-audio ``3 * window`` shape
-(BI batch 1). Compile-only skips dummy-audio warmup.
+preprocessor / encoder, then the long-audio ``3 * window`` dummy
+plus a last-window remainder (each twice) so the first real
+long-path encode is not a first-invocation compile/capture.
+Compile-only skips dummy-audio warmup.
 Pending-compile state is stored on the unwrapped module:
 ``CUDAGraphWrapper.__getattr__`` forwards, but ``delattr`` does not.
 
@@ -130,6 +132,9 @@ _DEFAULT_FRAME_BUCKET = 256
 _DEFAULT_MAX_WINDOWS = 2
 # First long-audio path is 3 windows (2-window clips stay whole-forward).
 _LONG_WARMUP_MIN_WINDOWS = 3
+# Each long dummy is encoded twice so first-invocation compile / graph
+# capture / lazy caches are done before serving.
+_LONG_WARMUP_REPEATS = 2
 # Flex / last-window remainders pad onto these (overridden from the runner).
 _FLEX_WINDOW = 550
 _FLEX_MAX_WINDOWS = _DEFAULT_MAX_WINDOWS
@@ -1580,6 +1585,34 @@ def _encoder_dtype_runtime():
     return speech_encoder_global_state(_ENCODER_DEFAULT_DTYPE)
 
 
+_ONLINE_RESET_NAMES = (
+    "reset_streaming_state",
+    "reset_cache",
+    "reset_online_state",
+)
+
+
+def _reset_online_encoder_state(runner: Any, model: Any = None) -> None:
+    """Drop leftover online / diarization state before each encode.
+
+    Warmup dummies and the previous request must not change the first
+    real long-path output.
+    """
+    perception = getattr(runner, "perception", None)
+    if perception is None and model is not None:
+        inner = unwrap_speech_encoder_model(model)
+        perception = getattr(inner, "perception", None)
+    encoder = getattr(perception, "encoder", None)
+    if encoder is None:
+        return
+    for name in _ONLINE_RESET_NAMES:
+        fn = getattr(encoder, name, None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn()
+                return
+
+
 def _crop_to_valid_audio(
     audio_signal: torch.Tensor, audio_lengths: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1666,6 +1699,18 @@ def _mark_processed_frames_dynamic(processed: torch.Tensor) -> torch.Tensor:
     return processed
 
 
+def _mark_len_dynamic(processed_len: torch.Tensor) -> torch.Tensor:
+    """Keep last-window valid out of dynamo static guards."""
+    if not isinstance(processed_len, torch.Tensor) or processed_len.ndim == 0:
+        return processed_len
+    mark = getattr(getattr(torch, "_dynamo", None), "mark_dynamic", None)
+    if mark is None:
+        return processed_len
+    with contextlib.suppress(Exception):
+        mark(processed_len, 0)
+    return processed_len
+
+
 def _prepare_processed(
     processed: torch.Tensor,
     processed_len: torch.Tensor,
@@ -1682,6 +1727,7 @@ def _prepare_processed(
         valid = int(processed_len.max().item())
     target = speech_encoder_served_frames(valid, runner, long=long)
     processed = _pad_processed(processed, target)
+    _mark_len_dynamic(processed_len)
     return _mark_processed_frames_dynamic(processed)
 
 
@@ -1870,6 +1916,7 @@ def configure_speech_encoder_graphs(
         processed_len: torch.Tensor,
         return_ctc_timestamp_inputs: bool,
     ):
+        _reset_online_encoder_state(runner, model)
         processed = _prepare_processed(processed, processed_len, runner, long=False)
         _record_encoder_path("short", processed, processed_len)
         # Serving transcription (inference_mode) uses the same graphs as
@@ -1942,6 +1989,7 @@ def configure_speech_encoder_graphs(
         return_ctc_timestamp_inputs: bool,
     ):
         with _encoder_dtype_runtime():
+            _reset_online_encoder_state(runner, model)
             processed = _prepare_processed(processed, processed_len, runner, long=True)
             _record_encoder_path("long", processed, processed_len)
             assert orig_call_long is not None
@@ -2207,11 +2255,13 @@ def _encoder_window(runner: Any, model: Any = None) -> int | None:
 def speech_encoder_warmup_long_frames(
     runner: Any = None, model: Any = None
 ) -> list[int]:
-    """One 3-window dummy for long-audio window-graph warmup (BI batch 1).
+    """3-window dummies for long-audio warmup, including a last-window remainder.
 
-    Flex q/k/v and ``create_block_mask`` pad last-window remainders to
-    ``window``, so extra ``n_windows * window`` captures only inflate
-    reused-cache ready time.
+    A full ``n * window`` dummy never exercises ``valid % window`` (the
+    121 s / 1512-frame path). The first real remainder then compiles or
+    captures and that first output differs from every later encode.
+    Flex still pads q/k/v to ``window``; these valids make the online
+    path / processed_len the same class serving will hit.
     """
     set_speech_encoder_shape_config(runner, model=model)
     window = _encoder_window(runner, model)
@@ -2219,10 +2269,16 @@ def speech_encoder_warmup_long_frames(
         return []
     short_windows = int(getattr(runner, "max_windows", None) or _DEFAULT_MAX_WINDOWS)
     n_windows = max(_LONG_WARMUP_MIN_WINDOWS, short_windows + 1)
-    length = n_windows * window
-    if length > _audio_cap_frames():
+    full = n_windows * window
+    if full > _audio_cap_frames():
         return []
-    return [length]
+    # Full windows, shortest remainder, and a mid-window remainder
+    # (2 * window + 3 * window // 4 == 1512 when window == 550).
+    lengths = [full, (n_windows - 1) * window + 1]
+    mid = (n_windows - 1) * window + (3 * window // 4)
+    if mid not in lengths and mid <= _audio_cap_frames():
+        lengths.append(mid)
+    return lengths
 
 
 def speech_encoder_profile_dummy_frames(
@@ -2414,19 +2470,25 @@ def _warmup_long_graphs(
     for frames in lengths:
         processed = torch.zeros(1, n_feat, frames, device=device, dtype=dtype)
         processed_len = torch.tensor([frames], device=device, dtype=torch.int64)
-        try:
-            call_long(processed, processed_len, False)
-            stats.long_captured += 1
-            stats.captured += 1
-        except Exception as exc:
-            stats.failed += 1
-            logger.error(
-                "Speech encoder long-window warmup failed for 1 x %d frames "
-                "(n_feat=%d): %s",
-                frames,
-                n_feat,
-                exc,
-            )
+        # Repeat so the first real request is not the first invocation of
+        # this (tensor width, last-window valid) class.
+        for _repeat in range(_LONG_WARMUP_REPEATS):
+            try:
+                call_long(processed, processed_len, False)
+                if _repeat == 0:
+                    stats.long_captured += 1
+                    stats.captured += 1
+            except Exception as exc:
+                stats.failed += 1
+                logger.error(
+                    "Speech encoder long-window warmup failed for 1 x %d "
+                    "frames (n_feat=%d, pass %d): %s",
+                    frames,
+                    n_feat,
+                    _repeat + 1,
+                    exc,
+                )
+                break
     if lengths and window and (1, window) not in getattr(runner, "graphs", {}):
         try:
             _capture_one_graph(runner, 1, window, n_feat, dtype)
@@ -2447,8 +2509,9 @@ def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
     """Capture graph buckets after KV. Compile-only does not dummy-encode.
 
     Under ``VLLM_BATCH_INVARIANT`` the whole-forward grid is batch 1 ×
-    frame buckets, then ``_call_long`` warms one ``3 * window`` dummy.
-    Flex pads last-window remainders to ``window``. ``layer.compile``
+    frame buckets, then ``_call_long`` warms the 3-window dummy plus a
+    last-window remainder, each twice. Flex pads remainders to
+    ``window``. ``layer.compile``
     uses dynamic shapes, so compile-only skips this warmup.
     Must not run during memory profiling.
 

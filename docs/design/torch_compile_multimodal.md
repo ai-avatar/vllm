@@ -132,8 +132,11 @@ an isolated BlockMask / valid-length cache. Graph runners set
 graphs as plain and still returns `(embeddings, states)`. Compile-off
 does not wrap `perception.forward` or rewrite that arity. A
 profile dummy with `window=max_frames` (e.g. 4000) does not pad a
-500-frame slice to 4000, and warmup also runs the
-`(1, n_feat, 3 * max_frames)` dummy `profile_run` still forwards.
+500-frame slice to 4000. Long warmup includes a last-window
+remainder (not only `3 * window` full-valid) so the first real
+121 s / 1512-frame encode is not a first-invocation compile, and
+also the `(1, n_feat, 3 * max_frames)` dummy `profile_run` still
+forwards.
 Flex is compiled with `dynamic=False` so
 those remainders cannot recompile. Compile-only skips dummy-audio warmup. Warmup time is
 logged and is not counted as peak activation. Pending-compile state is stored on the unwrapped

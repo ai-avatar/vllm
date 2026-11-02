@@ -46,26 +46,45 @@ def _seconds_to_frames(seconds: float, hop_s: float) -> int:
     return max(int(round(seconds / hop_s)), 1)
 
 
+def _as_batch_time_feat(tensor):
+    """Normalize encoder embeddings to ``(B, T, F)``.
+
+    Graph-runner rows are ``(T, D)``. Perception / encoder outputs are
+    ``(B, T, D)`` or ``(B, D, T)``. Input-frame counts must not be used
+    as T (compiled-vs-eager is ~T/8).
+    """
+    if tensor.ndim == 1:
+        return tensor.view(1, -1, 1)
+    if tensor.ndim == 2:
+        return tensor.unsqueeze(0)
+    if tensor.ndim == 3:
+        _batch, mid, last = tensor.shape
+        if last < mid and mid > 32:
+            return tensor.transpose(1, 2)
+        return tensor
+    return tensor.reshape(tensor.shape[0], -1, tensor.shape[-1])
+
+
 def _trim_to_common_valid(left, right, valid: int | None = None):
-    """Crop padded compiled output to the shared valid time length."""
+    """Crop compiled/eager embeddings to the shared encoder output length."""
     if left is None or right is None:
         return left, right
-    if tuple(left.shape) == tuple(right.shape) and valid is None:
-        return left, right
-    dims = min(left.ndim, right.ndim)
-    for dim in range(dims):
-        if left.shape[dim] == right.shape[dim] and (
-            valid is None or left.shape[dim] <= valid
-        ):
-            continue
-        n = min(int(left.shape[dim]), int(right.shape[dim]))
-        if valid is not None:
-            n = min(n, int(valid))
-        if n < left.shape[dim]:
-            left = left.narrow(dim, 0, n)
-        if n < right.shape[dim]:
-            right = right.narrow(dim, 0, n)
-    return left, right
+    left_btf = _as_batch_time_feat(left)
+    right_btf = _as_batch_time_feat(right)
+    n = min(int(left_btf.shape[1]), int(right_btf.shape[1]))
+    # ``valid`` is encoder output length when it is <= both times.
+    # Input-frame counts (29..1512) are larger than T/8 and must not cap.
+    if valid is not None and 0 < int(valid) <= n:
+        n = int(valid)
+    if n < left_btf.shape[1]:
+        left_btf = left_btf.narrow(1, 0, n)
+    if n < right_btf.shape[1]:
+        right_btf = right_btf.narrow(1, 0, n)
+    if left.ndim == 2:
+        left_btf = left_btf.squeeze(0)
+    if right.ndim == 2:
+        right_btf = right_btf.squeeze(0)
+    return left_btf, right_btf
 
 
 def _rel_err(left, right) -> float:
@@ -466,10 +485,12 @@ def _run_model(args: argparse.Namespace) -> int:
             return _encoder_forward(inner, processed, processed_len)
 
     print("warmup + compiled encodings")
-    torch._dynamo.reset()
+    # Do not torch._dynamo.reset(): the engine already warmed unique_graphs.
+    # Reset + a partial warmup makes the first 1512 look like a recompile.
     with torch.inference_mode():
-        for t in (256, args.window, 2 * args.window, 500):
+        for t in (256, args.window, 2 * args.window, 500, 1101, 1512):
             try:
+                encode(compiled_inner, t, inference=True)
                 encode(compiled_inner, t, inference=True)
             except Exception as exc:
                 print(f"  warmup T={t} skipped: {exc}")
@@ -494,29 +515,41 @@ def _run_model(args: argparse.Namespace) -> int:
     runner = getattr(compiled_inner, "_encoder_graphs", None)
     if runner is not None and hasattr(runner, "_call_long"):
         t_long = 1512
-        print(f"compiled T={t_long} plain vs timestamps flag (must be bitwise)")
+        print(f"compiled T={t_long} first vs later (must be bitwise)")
         try:
             torch.manual_seed(t_long)
             processed = torch.randn(1, n_feat, t_long, device=device, dtype=dtype)
             processed_len = torch.tensor([t_long], device=device, dtype=torch.int64)
+            other = torch.randn(1, n_feat, 1101, device=device, dtype=dtype)
+            other_len = torch.tensor([1101], device=device, dtype=torch.int64)
             with torch.inference_mode():
                 mm_encoder_mod._begin_encoder_mask(t_long)
-                plain = _first_tensor(
+                first = _first_tensor(
+                    runner._call_long(processed, processed_len, False)
+                )
+                second = _first_tensor(
+                    runner._call_long(processed, processed_len, False)
+                )
+                runner._call_long(other, other_len, False)
+                third = _first_tensor(
                     runner._call_long(processed, processed_len, False)
                 )
                 ts = _first_tensor(runner._call_long(processed, processed_len, True))
-            plain, ts = _trim_to_common_valid(plain, ts, valid=t_long)
-            match = bool(torch.equal(plain, ts))
+            first, second = _trim_to_common_valid(first, second)
+            first, third = _trim_to_common_valid(first, third)
+            first, ts = _trim_to_common_valid(first, ts)
+            match_later = bool(torch.equal(first, second) and torch.equal(first, third))
+            match_ts = bool(torch.equal(first, ts))
             decision = dict(mm_encoder_mod._LAST_ENCODER_DECISION)
             print(
-                f"  T={t_long} flag False vs True bitwise="
-                f"{'OK' if match else 'FAIL'} decision={decision}"
+                f"  T={t_long} first==later={'OK' if match_later else 'FAIL'} "
+                f"plain==ts={'OK' if match_ts else 'FAIL'} decision={decision}"
             )
-            if not match:
+            if not match_later or not match_ts:
                 failed += 1
         except Exception as exc:
             failed += 1
-            print(f"  T={t_long} flag compare FAIL: {exc}")
+            print(f"  T={t_long} first-vs-later FAIL: {exc}")
             traceback.print_exc()
 
     if args.aligner:
@@ -554,7 +587,7 @@ def _run_model(args: argparse.Namespace) -> int:
                     torch.manual_seed(t)
                     after = _first_tensor(encode(compiled_inner, t, inference=True))
                 before = _payload_to_tensor(compiled_out[t])
-                before, after = _trim_to_common_valid(before, after, valid=t)
+                before, after = _trim_to_common_valid(before, after)
                 match = bool(torch.equal(before, after))
                 print(f"  T={t} after-aligner bitwise={'OK' if match else 'FAIL'}")
                 if not match:
@@ -571,7 +604,7 @@ def _run_model(args: argparse.Namespace) -> int:
         try:
             left = _payload_to_tensor(compiled_out[t])
             eager_out = _payload_to_tensor(eager["outs"][str(t)])
-            left, eager_out = _trim_to_common_valid(left, eager_out, valid=t)
+            left, eager_out = _trim_to_common_valid(left, eager_out)
             rel = _rel_err(left, eager_out)
             mad = _max_abs(left, eager_out)
             ok = rel < 0.08
