@@ -1273,3 +1273,23 @@ def test_combo_kernel_defaults_without_inductor_deterministic_setting():
 
     assert config.inductor_compile_config["combo_kernels"] is True
     assert config.inductor_compile_config["benchmark_combo_kernel"] is True
+
+
+def test_dynamic_scale_rblock_defaults_false():
+    from torch._inductor import config as inductor_config
+
+    if not hasattr(inductor_config, "dynamic_scale_rblock"):
+        pytest.skip("this torch build has no dynamic_scale_rblock")
+    config = CompilationConfig()
+    assert config.inductor_compile_config["dynamic_scale_rblock"] is False
+
+
+def test_dynamic_scale_rblock_explicit_true_preserved():
+    config = CompilationConfig(inductor_compile_config={"dynamic_scale_rblock": True})
+    assert config.inductor_compile_config["dynamic_scale_rblock"] is True
+
+
+def test_dynamic_scale_rblock_skipped_when_inductor_lacks_flag():
+    with patch("torch._inductor.config", SimpleNamespace()):
+        config = CompilationConfig()
+    assert "dynamic_scale_rblock" not in config.inductor_compile_config

@@ -263,6 +263,12 @@ Explicit `combo_kernels` or `benchmark_combo_kernel` settings are preserved.
 This avoids conflicting compilation defaults; it does not guarantee reproducible
 model outputs.
 
+vLLM also defaults `dynamic_scale_rblock` to `False` in
+`inductor_compile_config` (explicit `True` is preserved). That stops inductor
+from appending a halved R0_BLOCK to single-config reductions and timing 1024
+vs 512 on every load. Multi-config winners are pinned separately: see
+[Inductor autotune pins](../features/batch_invariance.md#inductor-autotune-pins-this-fork).
+
 ### Inductor runtime assertions
 
 By default (on torch < 2.12), vLLM disables Inductor's runtime assertions

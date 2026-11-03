@@ -26,6 +26,22 @@ logger = init_logger(__name__)
 _last_inductor_triton_cache_dir: str | None = None
 
 
+def _install_pinned_inductor_autotune_cache(inductor_cache: str) -> None:
+    """Copy SKU-pinned AutotuneCache files into TORCHINDUCTOR_CACHE_DIR."""
+    try:
+        from vllm.compilation.inductor_autotune_pin import (
+            install_pinned_autotune_cache,
+        )
+
+        install_pinned_autotune_cache(inductor_cache)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to install pinned inductor autotune cache into %s: %s",
+            inductor_cache,
+            exc,
+        )
+
+
 class CompilerInterface:
     """The interface for a compiler that can be used by vLLM."""
 
@@ -270,6 +286,12 @@ class InductorStandaloneAdaptor(CompilerInterface):
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
     ) -> None:
         self.cache_dir = cache_dir
+        if disable_cache:
+            return
+        inductor_cache = os.path.join(cache_dir, "inductor_cache")
+        os.makedirs(inductor_cache, exist_ok=True)
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", inductor_cache)
+        _install_pinned_inductor_autotune_cache(os.environ["TORCHINDUCTOR_CACHE_DIR"])
 
     def compile(
         self,
@@ -465,6 +487,7 @@ class InductorAdaptor(CompilerInterface):
         inductor_cache = os.path.join(self.base_cache_dir, "inductor_cache")
         os.makedirs(inductor_cache, exist_ok=True)
         os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
+        _install_pinned_inductor_autotune_cache(inductor_cache)
         triton_cache = os.environ.get("TRITON_CACHE_DIR")
         # A directory assigned by an earlier adaptor is still a model-local
         # default, rather than a caller override for subsequent models.

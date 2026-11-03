@@ -267,8 +267,67 @@ Kernel tests (GPU when present; CPU covers the config / backend checks):
   tests/v1/determinism/test_mamba2_bi_scheduler.py \
   tests/v1/determinism/test_mm_encoder_batch_invariant.py \
   tests/v1/determinism/test_gate_linear_batch_invariant.py \
-  tests/v1/determinism/test_ampere_matmul_static_config.py -v
+  tests/v1/determinism/test_ampere_matmul_static_config.py \
+  tests/compile/test_inductor_autotune_pin.py \
+  tests/compile/test_config.py -k dynamic_scale_rblock -v
 ```
+
+### Inductor autotune pins (this fork)
+
+Inductor fused add+RMSNorm reductions are single-config (R0_BLOCK 1024).
+On every load, `_dynamic_scale_rblock()` used to append a halved 512
+config and time the two by wall clock; a 512 win changes RMSNorm order
+and is the decoder ALT state (~1 in 24). vLLM now defaults
+`inductor_compile_config["dynamic_scale_rblock"] = False`, so those
+kernels stay on 1024 with no runtime benchmark.
+
+Multi-config kernels (for example rms_norm 4096 vs 2048) are still timed
+once at cold compile. Those winners live as `*.best_config` files under
+`TORCHINDUCTOR_CACHE_DIR`. Pin them per GPU SKU and load them before
+precompile so every autotuner is single-config or a cache hit. After
+warmup the worker logs `inductor runtime benchmarks: N (...)` and, under
+`VLLM_BATCH_INVARIANT=1`, **fails startup** if N is not 0.
+
+Do not set `inductor_compile_config.deterministic=true` /
+`TORCHINDUCTOR_DETERMINISTIC`: that picks the second-largest RBLOCK and
+is a different (broken) numeric path.
+
+Pinned packs are GPU- and torch-version-specific. A100 (sm80) must not
+be reused on L40S (sm89) or H100. Regenerate whenever torch, triton,
+vLLM, the model graph, or inductor config changes.
+
+#### Generate and load on the pod (A100 vs L40S)
+
+```bash
+# SKU key is family + compute capability, e.g. a100-sm80 or l40s-sm89
+.venv/bin/python -m vllm.compilation.inductor_autotune_pin sku
+
+# 1) Reference cold compile on this GPU, dump the AutotuneCache winners.
+#    ALLOW_BENCH is required for this first run (the dump is the point).
+rm -rf ~/.cache/vllm/torch_compile_cache
+export VLLM_BATCH_INVARIANT=1
+export VLLM_INDUCTOR_AUTOTUNE_ALLOW_BENCH=1
+export VLLM_INDUCTOR_AUTOTUNE_PIN_DUMP=1
+vllm serve <nemotron-3.5-transcribe-bf16> ...  # same flags as production
+# pack lands in $VLLM_CACHE_ROOT/inductor_autotune_pins/$(python -m ... sku)/
+
+# Or copy from an existing inductor cache after a REF process:
+.venv/bin/python -m vllm.compilation.inductor_autotune_pin dump \
+  --cache-dir "$TORCHINDUCTOR_CACHE_DIR" \
+  --output ~/.cache/vllm/inductor_autotune_pins/a100-sm80
+
+# 2) Subsequent starts: load the pack before precompile, fail if any
+#    kernel still benchmarks.
+unset VLLM_INDUCTOR_AUTOTUNE_ALLOW_BENCH VLLM_INDUCTOR_AUTOTUNE_PIN_DUMP
+export VLLM_INDUCTOR_AUTOTUNE_PIN_DIR=~/.cache/vllm/inductor_autotune_pins/a100-sm80
+VLLM_BATCH_INVARIANT=1 vllm serve <nemotron-3.5-transcribe-bf16> ...
+# log must contain: inductor runtime benchmarks: 0
+```
+
+On L40S use `l40s-sm89` (the `sku` command prints it). Keep one pack per
+SKU; do not mix. If the compile cache is wiped, keep the pin pack — load
+still seeds `TORCHINDUCTOR_CACHE_DIR` before the new compile's
+precompile.
 
 ### Speed cost (A100 BF16 Nemotron 3.5 Transcribe, measured)
 
@@ -310,8 +369,13 @@ When batch invariance is enabled, vLLM:
    candidates BI-ok). Unmatched shapes keep the generic 128×128×64 default.
    This does not enable breakable CUDA graphs (those exist for M-bucketed
    Ada/Hopper/Blackwell tables).
-7. Splits the LoRA shrink reduction into 8 fixed K chunks that are summed in a fixed order instead of with atomics
-8. For Mamba2, pins SSD Triton tiles and the decode SSU launch config so they
+7. Pins inductor kernel selection so fused add+RMSNorm reductions do not
+   re-time R0_BLOCK 1024 vs 512 on every process, and so multi-config
+   kernels reuse a SKU-keyed AutotuneCache pack instead of re-benchmarking
+   on every cold compile. See
+   [Inductor autotune pins](#inductor-autotune-pins-this-fork).
+8. Splits the LoRA shrink reduction into 8 fixed K chunks that are summed in a fixed order instead of with atomics
+9. For Mamba2, pins SSD Triton tiles and the decode SSU launch config so they
    no longer depend on token count or `effective_batch`. FlashInfer SSU,
    ReplaySSM, and Mamba stochastic rounding are rejected rather than ignored.
    Prefill splits are aligned to the Mamba chunk size. Multimodal encoder

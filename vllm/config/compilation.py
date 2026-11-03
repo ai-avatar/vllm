@@ -974,6 +974,19 @@ class CompilationConfig:
             ):
                 self.inductor_compile_config.setdefault(key, enable_asserts)
 
+        # Occupancy-driven RBLOCK scaling appends a halved R0_BLOCK to
+        # single-config reductions (fused add+RMSNorm) on every load and
+        # times 1024 vs 512. The pick is not persisted and changes RMSNorm
+        # reduction order. Keep the heuristic 1024 config (the faster one).
+        try:
+            from torch._inductor import config as inductor_config
+        except ImportError:
+            inductor_config = None
+        if inductor_config is not None and hasattr(
+            inductor_config, "dynamic_scale_rblock"
+        ):
+            self.inductor_compile_config.setdefault("dynamic_scale_rblock", False)
+
         for k, v in self.inductor_passes.items():
             if not isinstance(v, str):
                 assert callable(v), f"pass {k} should be callable or a qualified name"
