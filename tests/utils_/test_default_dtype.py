@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests for serving default_dtype isolation.
 
-NeMo ``_forward_online_impl`` / ``_init_streaming_diar`` wrap Sortformer
-with ``_default_dtype(stream_dtype)``. ``init_streaming_state`` then
-does ``torch.zeros(..., device=)`` with no dtype. The process default
-must stay fp32 on every other thread (EngineCore.step / CTC prepare)
-while those zeros are still bf16 on the encoder thread.
+NeMo ``_default_dtype(stream_dtype)`` used to call ``set_default_dtype``.
+Dynamo's ``convert_frame`` snapshots ``get_default_dtype()`` and restores
+it; a lying get-wrap made that restore write bf16 into the process and
+raise ``Global default_dtype state changed while dynamo tracing``.
+
+The factory pin must produce the same tensors as the old global window
+without changing the process default, including under ``torch.compile``.
 """
 
 from __future__ import annotations
@@ -19,9 +21,11 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import torch
+from torch import nn
 
 import vllm.envs as envs
 from vllm.utils.default_dtype import (
+    _coerce_streaming_state_dtype,
     check_serving_default_dtype,
     install_default_dtype_guards,
     process_default_dtype,
@@ -40,6 +44,31 @@ def _restore_default_dtype():
         yield
     finally:
         torch.set_default_dtype(prev)
+
+
+@contextlib.contextmanager
+def _legacy_global_window(dtype: torch.dtype):
+    """NeMo / old ``_pin_default_dtype`` get/set/restore."""
+    prev = torch.get_default_dtype()
+    if dtype != prev and dtype.is_floating_point:
+        torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(prev)
+
+
+class _SortformerLikeBlock(nn.Module):
+    """LayerNorm + Linear + implicit ``torch.zeros`` (streaming pad)."""
+
+    def __init__(self, dim: int = 8):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.lin = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pad = torch.zeros(x.size(0), x.size(1), x.size(2), device=x.device)
+        return self.lin(self.norm(x)) + pad
 
 
 def test_two_thread_unlocked_interleave_leaks_bf16():
@@ -75,18 +104,26 @@ def test_two_thread_unlocked_interleave_leaks_bf16():
         assert process_default_dtype() == torch.bfloat16
 
 
-def test_virtual_pin_keeps_process_fp32_and_creates_bf16():
+def test_factory_pin_matches_legacy_window_values():
+    """Implicit zeros / encoder block match the old set_default_dtype window."""
     install_default_dtype_guards()
+    block = _SortformerLikeBlock().to(torch.bfloat16)
+    x = torch.randn(2, 4, 8, dtype=torch.bfloat16)
     with _restore_default_dtype():
+        with _legacy_global_window(torch.bfloat16):
+            legacy_zeros = torch.zeros(3, 5)
+            legacy_long = torch.zeros(2, dtype=torch.long)
+            legacy_out = block(x).detach().clone()
         with virtual_default_dtype(torch.bfloat16):
-            assert torch.get_default_dtype() == torch.bfloat16
-            zeros = torch.zeros(2, 3)
-            longs = torch.zeros(2, dtype=torch.long)
-            assert zeros.dtype == torch.bfloat16
-            assert longs.dtype == torch.long
-            assert process_default_dtype() == torch.float32
+            pinned_zeros = torch.zeros(3, 5)
+            pinned_long = torch.zeros(2, dtype=torch.long)
+            pinned_out = block(x)
+            assert torch.get_default_dtype() == torch.float32
+        assert pinned_zeros.dtype == legacy_zeros.dtype == torch.bfloat16
+        assert pinned_long.dtype == legacy_long.dtype == torch.long
+        assert torch.equal(pinned_zeros, legacy_zeros)
+        assert torch.equal(pinned_out, legacy_out)
         assert process_default_dtype() == torch.float32
-        assert torch.zeros(1).dtype == torch.float32
 
 
 def test_nemo_streaming_encoder_section_checker_thread_sees_fp32():
@@ -132,6 +169,7 @@ def test_nemo_streaming_encoder_section_checker_thread_sees_fp32():
                 assert state.fifo.dtype == stream_dtype
                 assert state.lengths.dtype == torch.long
                 assert preds.dtype == stream_dtype
+                assert torch.get_default_dtype() == torch.float32
                 inside.set()
                 assert leave.wait(timeout=5)
 
@@ -163,6 +201,35 @@ def test_nemo_streaming_encoder_section_checker_thread_sees_fp32():
             assert serving_default_dtype_mismatch_count() == before
     finally:
         sys.modules.pop(name, None)
+
+
+def test_dynamo_trace_under_factory_pin_keeps_process_fp32():
+    """Sortformer-like block under the shim must not trip convert_frame."""
+    install_default_dtype_guards()
+    block = _SortformerLikeBlock().to(torch.bfloat16)
+    x = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+    with _restore_default_dtype():
+        with _legacy_global_window(torch.bfloat16):
+            legacy = block(x).detach().clone()
+        with virtual_default_dtype(torch.bfloat16):
+            compiled = torch.compile(block, backend="eager")
+            out = compiled(x)
+            assert torch.get_default_dtype() == torch.float32
+        assert process_default_dtype() == torch.float32
+        assert out.dtype == legacy.dtype
+        assert torch.equal(out, legacy)
+
+
+def test_coerce_streaming_state_dtype_matches_param_dtype():
+    state = SimpleNamespace(
+        spkcache=torch.zeros(1, 2, 4),
+        fifo=torch.zeros(1, 1, 4),
+        lengths=torch.zeros(1, dtype=torch.long),
+    )
+    out = _coerce_streaming_state_dtype(state, torch.bfloat16)
+    assert out.spkcache.dtype == torch.bfloat16
+    assert out.fifo.dtype == torch.bfloat16
+    assert out.lengths.dtype == torch.long
 
 
 def test_wrap_nemo_default_dtype_is_idempotent():

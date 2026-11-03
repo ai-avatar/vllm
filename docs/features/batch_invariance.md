@@ -181,11 +181,11 @@ in the decode or prefill batch.
   limits are raised process-wide (and on the encoder / diarizer thread),
   `kernel_options` / `inference_mode` are normalized so the cache is
   not request-order dependent. Serving never calls `set_default_dtype`
-  (process default stays fp32). NeMo `_default_dtype` is a thread-local
-  pin so Sortformer `torch.zeros(..., device=)` still gets bf16. A
-  request-boundary check WARNs if the process default is not fp32.
-  Startup fails if flex compiles `_flex_attention_hop_wrapper` with
-  `backend=eager`.
+  (process default stays fp32 so dynamo GLOBAL_STATE does not move).
+  NeMo `_default_dtype` is a thread-local factory pin so Sortformer
+  `torch.zeros(..., device=)` still gets bf16. A request-boundary check
+  WARNs if the process default is not fp32. Startup fails if flex
+  compiles `_flex_attention_hop_wrapper` with `backend=eager`.
   Encoder CUDA
   graphs (`cudagraph_mm_encoder`, `VLLM_CUDAGRAPH_MM_ENCODER`, or
   `encoder_cuda_graphs`) are equivalent; they stay off unless any of

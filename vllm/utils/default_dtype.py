@@ -3,21 +3,20 @@
 """Keep the process ``default_dtype`` at fp32 during serving.
 
 ``torch.get_default_dtype`` / ``set_default_dtype`` are process-global.
-EngineCore runs the model-runner next to ``nemo-ctc-prepare``. NeMo
-``parallel_expert_encoder._default_dtype(stream_dtype)`` (hot path:
+NeMo ``parallel_expert_encoder._default_dtype(stream_dtype)`` (hot path:
 ``_forward_online_impl`` / ``_init_streaming_diar``) and the old fork
-``_pin_default_dtype`` both did ``prev=get(); set(x); ...; set(prev)``.
+``_pin_default_dtype`` both called ``set_default_dtype``. Dynamo's
+``convert_frame`` snapshots ``get_default_dtype()`` and restores it with
+``set_default_dtype``; a Python wrap of ``get_default_dtype`` that
+returns a thread-local bf16 makes that restore write bf16 into the
+process and then raises ``Global default_dtype state changed while
+dynamo tracing``.
 
-A lock around that section is not enough: while MainThread pins bf16
-for every Sortformer window, every other thread — including
-``EngineCore.step`` — sees bf16. Under BI the old check raised and
-killed the server. Crossed restores can also leave the process at bf16
-(Sortformer ``layer_norm`` Float vs BFloat16; dynamo ``GLOBAL_STATE``).
-
-Serving never calls ``set_default_dtype``. NeMo ``_default_dtype`` is
-replaced at load with a thread-local pin: ``torch.zeros(..., device=)``
-inside ``init_streaming_state`` still gets ``stream_dtype`` (PR #5
-numerics) while the process default stays fp32.
+Serving therefore never wraps ``get`` / ``set``. NeMo ``_default_dtype``
+is replaced with a thread-local factory pin: ``torch.zeros(...,
+device=)`` inside ``init_streaming_state`` still gets ``stream_dtype``
+(same tensors as the old global window) while every other thread, and
+dynamo, see process fp32.
 """
 
 from __future__ import annotations
@@ -38,18 +37,21 @@ logger = init_logger(__name__)
 _TLS = threading.local()
 _WRAPPED_ATTR = "_vllm_default_dtype_virtual"
 _FACTORY_NAMES = ("empty", "zeros", "ones", "full", "randn", "rand")
+_STATE_FLOAT_ATTRS = (
+    "spkcache",
+    "spkcache_preds",
+    "fifo",
+    "mean_sil_emb",
+)
 
 SERVING_DEFAULT_DTYPE = torch.float32
 
-_ORIG_GET: Callable[[], torch.dtype] | None = None
 _MISMATCH_COUNT = 0
 _PROM: Any = None
 
 
 def process_default_dtype() -> torch.dtype:
-    """Process-global default, ignoring any thread-local serving pin."""
-    if _ORIG_GET is not None:
-        return _ORIG_GET()
+    """Process-global default (never a thread-local serving pin)."""
     return torch.get_default_dtype()
 
 
@@ -64,10 +66,7 @@ def _tls_dtype() -> torch.dtype | None:
 
 @contextlib.contextmanager
 def virtual_default_dtype(dtype: torch.dtype | None) -> Iterator[None]:
-    """Pin factories / ``get_default_dtype`` on this thread only.
-
-    Does not call ``set_default_dtype``. ``dtype=None`` is a no-op.
-    """
+    """Pin factory dtypes on this thread. Does not call get/set_default_dtype."""
     if dtype is None or not getattr(dtype, "is_floating_point", False):
         yield
         return
@@ -106,25 +105,6 @@ def wrap_nemo_default_dtype(cm: Callable[..., Any]) -> Callable[..., Any]:
         _virtual = functools.update_wrapper(_virtual, cm)
     setattr(_virtual, _WRAPPED_ATTR, True)
     return _virtual
-
-
-def _wrap_get_default_dtype() -> None:
-    global _ORIG_GET
-    current = torch.get_default_dtype
-    if getattr(current, _WRAPPED_ATTR, False):
-        return
-    _ORIG_GET = current
-
-    def _get() -> torch.dtype:
-        virt = _tls_dtype()
-        if virt is not None:
-            return virt
-        return current()
-
-    with contextlib.suppress(Exception):
-        _get = functools.update_wrapper(_get, current)
-    setattr(_get, _WRAPPED_ATTR, True)
-    torch.get_default_dtype = _get
 
 
 def _wrap_factory(orig: Callable[..., Any]) -> Callable[..., Any]:
@@ -167,8 +147,61 @@ def _wrap_attr_if_default_dtype(owner: Any, attr: str, value: Any) -> None:
         return
 
 
-def _wrap_nemo_default_dtype_cms() -> None:
-    """Replace imported NeMo ``_default_dtype`` CMs with the thread-local pin."""
+def _module_float_dtype(module: Any) -> torch.dtype | None:
+    params = getattr(module, "parameters", None)
+    if not callable(params):
+        return None
+    try:
+        for param in params():
+            if getattr(param, "is_floating_point", lambda: False)():
+                return param.dtype
+    except Exception:
+        return None
+    return None
+
+
+def _coerce_streaming_state_dtype(state: Any, dtype: torch.dtype | None) -> Any:
+    if state is None or dtype is None or not dtype.is_floating_point:
+        return state
+    for name in _STATE_FLOAT_ATTRS:
+        tensor = getattr(state, name, None)
+        if (
+            isinstance(tensor, torch.Tensor)
+            and tensor.is_floating_point()
+            and tensor.dtype != dtype
+        ):
+            setattr(state, name, tensor.to(dtype))
+    return state
+
+
+def _wrap_init_streaming_state(fn: Callable[..., Any]) -> Callable[..., Any]:
+    if getattr(fn, _WRAPPED_ATTR, False):
+        return fn
+
+    def _wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        dtype = _module_float_dtype(self)
+        state = fn(self, *args, **kwargs)
+        return _coerce_streaming_state_dtype(state, dtype)
+
+    with contextlib.suppress(Exception):
+        _wrapped = functools.update_wrapper(_wrapped, fn)
+    setattr(_wrapped, _WRAPPED_ATTR, True)
+    return _wrapped
+
+
+def _wrap_attr_if_init_streaming_state(owner: Any, value: Any) -> None:
+    if not callable(value) or getattr(value, "__name__", "") != "init_streaming_state":
+        return
+    if getattr(value, _WRAPPED_ATTR, False):
+        return
+    try:
+        owner.init_streaming_state = _wrap_init_streaming_state(value)
+    except Exception:
+        return
+
+
+def _wrap_nemo_serving_sites() -> None:
+    """No-op NeMo ``_default_dtype``; force streaming-state factory dtypes."""
     for name, mod in list(sys.modules.items()):
         if mod is None or not _is_nemo_module_name(name):
             continue
@@ -178,6 +211,7 @@ def _wrap_nemo_default_dtype_cms() -> None:
         _wrap_attr_if_default_dtype(
             mod, "_default_dtype", mapping.get("_default_dtype")
         )
+        _wrap_attr_if_init_streaming_state(mod, mapping.get("init_streaming_state"))
         for _, obj in list(mapping.items()):
             if not isinstance(obj, type):
                 continue
@@ -187,18 +221,20 @@ def _wrap_nemo_default_dtype_cms() -> None:
             _wrap_attr_if_default_dtype(
                 obj, "_default_dtype", cls_dict.get("_default_dtype")
             )
+            _wrap_attr_if_init_streaming_state(
+                obj, cls_dict.get("init_streaming_state")
+            )
 
 
 def install_default_dtype_guards() -> None:
-    """Install thread-local NeMo pins and factory dtype injection.
+    """Install factory pins and NeMo no-op ``_default_dtype``.
 
-    Idempotent. Safe at model load and again after late NeMo imports.
-    Does not wrap ``set_default_dtype`` (load-time helpers still set the
-    process default; serving ``_default_dtype`` no longer calls it).
+    Does not wrap ``get_default_dtype`` / ``set_default_dtype``. Dynamo
+    snapshots those and a lying ``get`` makes ``convert_frame`` restore
+    bf16 into the process.
     """
-    _wrap_get_default_dtype()
     _wrap_torch_factories()
-    _wrap_nemo_default_dtype_cms()
+    _wrap_nemo_serving_sites()
 
 
 def _inc_mismatch_metric() -> None:

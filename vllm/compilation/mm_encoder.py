@@ -338,18 +338,26 @@ def _is_dynamo_compiling() -> bool:
 
 
 @contextlib.contextmanager
-def _flex_call_context():
-    """Run flex under inference_mode so dynamo does not recompile on that guard.
+def _flex_call_context(query: Any):
+    """inference_mode + thread-local factory dtype pin (not set_default_dtype).
 
     Skipped while dynamo is tracing so encoder ``layer.compile`` still
-    inlines flex. Applied on the Python entry to NeMo's compiled wrapper
-    (compile-off production, encoder / diarizer threads). Does not touch
-    process-global ``default_dtype``; tensors pass ``dtype=`` explicitly.
+    inlines flex. Applied on the Python entry to NeMo's compiled wrapper.
+    Factories without ``dtype=`` use ``query.dtype``; the process default
+    stays fp32 so dynamo ``GLOBAL_STATE`` does not move.
     """
-    if _is_dynamo_compiling() or torch.is_inference_mode_enabled():
+    if _is_dynamo_compiling():
         yield
         return
-    with torch.inference_mode():
+    from vllm.utils.default_dtype import virtual_default_dtype
+
+    dtype = getattr(query, "dtype", None)
+    pin = virtual_default_dtype(dtype if isinstance(dtype, torch.dtype) else None)
+    if torch.is_inference_mode_enabled():
+        with pin:
+            yield
+        return
+    with torch.inference_mode(), pin:
         yield
 
 
@@ -439,10 +447,10 @@ def _force_flex_attention_kernel(fn: Any) -> Any:
     """Wrap ``fn`` so inductor cannot pick flex-decoding for short Q.
 
     Also reapplies dynamo limits on the calling thread and, when not
-    tracing, runs under ``inference_mode`` so autograd vs inference_mode
+    tracing, runs under ``inference_mode`` and a thread-local factory
+    dtype pin (``query.dtype``) so autograd / implicit ``torch.zeros``
     do not explode the compiled-flex guard set. Always sets
-    ``kernel_options`` so None vs set is not a variant. Does not change
-    process-global ``default_dtype``.
+    ``kernel_options``. Does not call ``set_default_dtype``.
     """
     if fn is None or getattr(fn, _FLEX_ISOLATED_ATTR, False):
         return fn
@@ -452,7 +460,8 @@ def _force_flex_attention_kernel(fn: Any) -> Any:
         opts = dict(kwargs.get("kernel_options") or {})
         opts["FORCE_USE_FLEX_ATTENTION"] = True
         kwargs["kernel_options"] = opts
-        with _flex_call_context():
+        query = args[0] if args else kwargs.get("query")
+        with _flex_call_context(query):
             return fn(*args, **kwargs)
 
     with contextlib.suppress(Exception):
@@ -748,8 +757,11 @@ def _call_graph_runner_per_item(
 def _capture_one_graph(
     runner: Any, rows: int, frames: int, n_feat: int, dtype: torch.dtype
 ) -> None:
+    from vllm.utils.default_dtype import virtual_default_dtype
+
     configure_speech_encoder_dynamo()
-    runner._capture(rows, frames, n_feat, dtype)
+    with virtual_default_dtype(dtype if dtype.is_floating_point else None):
+        runner._capture(rows, frames, n_feat, dtype)
 
 
 def configure_speech_encoder_graphs(
@@ -910,7 +922,26 @@ def enable_speech_encoder_graph_capture(model: nn.Module | None) -> None:
 
 
 def _compile_speech_encoder_layers(model: nn.Module, layers: list[nn.Module]) -> int:
+    from vllm.utils.default_dtype import virtual_default_dtype
+
     compile_kwargs = speech_encoder_layer_compile_kwargs()
+    compiled = 0
+    dtype = _module_floating_dtype(model)
+    with virtual_default_dtype(dtype):
+        compiled = _compile_speech_encoder_layers_inner(layers, compile_kwargs)
+    if compiled:
+        logger.info(
+            "Compiled %d speech-encoder layer(s) with dynamic shapes "
+            "(compile_mm_encoder=True, backend=inductor, "
+            "FORCE_USE_FLEX_ATTENTION).",
+            compiled,
+        )
+    return compiled
+
+
+def _compile_speech_encoder_layers_inner(
+    layers: list[nn.Module], compile_kwargs: dict[str, Any]
+) -> int:
     compiled = 0
     for layer in layers:
         if getattr(layer, _COMPILED_ATTR, False):
@@ -926,13 +957,6 @@ def _compile_speech_encoder_layers(model: nn.Module, layers: list[nn.Module]) ->
             continue
         setattr(layer, _COMPILED_ATTR, True)
         compiled += 1
-    if compiled:
-        logger.info(
-            "Compiled %d speech-encoder layer(s) with dynamic shapes "
-            "(compile_mm_encoder=True, backend=inductor, "
-            "FORCE_USE_FLEX_ATTENTION).",
-            compiled,
-        )
     return compiled
 
 
@@ -1351,6 +1375,8 @@ def warmup_speech_flex_variants(model: Any = None) -> int:
 
     """
     guard_speech_flex_attention(model)
+    from vllm.utils.default_dtype import virtual_default_dtype
+
     if model is None:
         return 0
     device = _model_device(model)
@@ -1369,7 +1395,7 @@ def warmup_speech_flex_variants(model: Any = None) -> int:
     hops_before = speech_flex_eager_hop_compile_count()
     for module in _speech_flex_modules(inner):
         for dtype in dtypes:
-            with torch.inference_mode():
+            with virtual_default_dtype(dtype), torch.inference_mode():
                 for batch in _FLEX_WARMUP_BATCHES:
                     for frames in _FLEX_WARMUP_FRAMES:
                         if _try_call_speech_encoder(
@@ -1398,28 +1424,36 @@ def warmup_speech_flex_variants(model: Any = None) -> int:
 def enable_speech_encoder_after_kv(model: nn.Module | None) -> SpeechEncoderWarmupStats:
     """Compile deferred layers, enable capture, and warm graph / flex variants.
 
-    Installs the thread-local NeMo ``_default_dtype`` pin so serving
-    never calls ``set_default_dtype``. Compile and capture pass
-    ``dtype=`` explicitly. Runs after KV allocation so this is not
-    counted as peak activation. Compile-only skips dummy graph
-    captures. Nemotron still warms flex variants with compile off so
-    the dynamo cache is not request-order dependent.
+    Installs the thread-local factory pin (not ``set_default_dtype``)
+    so compile / capture / flex warmup create the same dtypes as the
+    old global window. Runs after KV allocation so this is not counted
+    as peak activation. Compile-only skips dummy graph captures.
+    Nemotron still warms flex variants with compile off so the dynamo
+    cache is not request-order dependent.
     """
-    from vllm.utils.default_dtype import install_default_dtype_guards
+    from vllm.utils.default_dtype import (
+        install_default_dtype_guards,
+        virtual_default_dtype,
+    )
 
     install_default_dtype_guards()
     if model is None:
         return SpeechEncoderWarmupStats()
+    inner = unwrap_speech_encoder_model(model)
+    dtype = None
+    if isinstance(inner, nn.Module):
+        dtype = _module_floating_dtype(inner)
     guard = should_guard_speech_flex(model) or _SPEECH_FLEX_ACTIVE
-    if guard:
-        guard_speech_flex_attention(model)
-    compile_pending_speech_encoder_layers(model)
-    enable_speech_encoder_graph_capture(model)
-    stats = warmup_speech_encoder(model)
-    if guard:
-        stats.flex_warmed = warmup_speech_flex_variants(model)
-        stats.eager_hop_compiles = speech_flex_eager_hop_compile_count()
-    return stats
+    with virtual_default_dtype(dtype):
+        if guard:
+            guard_speech_flex_attention(model)
+        compile_pending_speech_encoder_layers(model)
+        enable_speech_encoder_graph_capture(model)
+        stats = warmup_speech_encoder(model)
+        if guard:
+            stats.flex_warmed = warmup_speech_flex_variants(model)
+            stats.eager_hop_compiles = speech_flex_eager_hop_compile_count()
+        return stats
 
 
 def maybe_compile_speech_mm_encoder(
