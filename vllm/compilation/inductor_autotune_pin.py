@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pin inductor AutotuneCache ``*.best_config`` files per GPU SKU.
 
-Multi-config inductor kernels (e.g. rms_norm R0_BLOCK 4096 vs 2048) are
-timed once at cold compile. The winner is stored as a ``.best_config``
-file under ``TORCHINDUCTOR_CACHE_DIR``. Loading those files *before*
-``CompiledArtifact.load`` / ``CachingAutotuner.precompile`` makes every
-autotuner a cache hit (or already single-config), so warmup never
-re-times.
+Multi-config inductor kernels (e.g. rms_norm R0_BLOCK 4096 vs 2048)
+used to be timed once at cold compile. Under ``VLLM_BATCH_INVARIANT``
+the saved config is the largest-R0_BLOCK rule pick, not the timed
+winner, so two machines of the same SKU write the same pack. Loading
+those files *before* ``CompiledArtifact.load`` /
+``CachingAutotuner.precompile`` makes every autotuner a cache hit (or
+already single-config), so warmup never re-times.
 
 Pinned choices are GPU- and torch-version-specific. Generate a pack on
 the target SKU (A100 sm80 vs L40S sm89) and keep it keyed by device
@@ -19,6 +20,8 @@ family plus compute capability. See
         --cache-dir $TORCHINDUCTOR_CACHE_DIR --output /path/to/pack
     python -m vllm.compilation.inductor_autotune_pin install \\
         --source /path/to/pack --cache-dir $TORCHINDUCTOR_CACHE_DIR
+    python -m vllm.compilation.inductor_autotune_pin verify \\
+        --pack /path/to/pack --ref /path/to/reference
 """
 
 from __future__ import annotations
@@ -35,11 +38,17 @@ from typing import Any
 import regex as re
 
 import vllm.envs as envs
+from vllm.compilation.inductor_autotune_pick import (
+    PICK_RULE,
+    normalize_best_config,
+    pick_reports,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
 MANIFEST_NAME = "manifest.json"
+PICK_REPORT_NAME = "pick_report.json"
 SCHEMA_VERSION = 1
 BEST_CONFIG_SUFFIX = ".best_config"
 
@@ -216,6 +225,14 @@ def dump_pinned_autotune_cache(
             gpu_name = current_platform.get_device_name()
     except Exception:  # noqa: BLE001
         pass
+    reports = pick_reports()
+    if reports:
+        report_path = dest / PICK_REPORT_NAME
+        tmp = dest / f".{PICK_REPORT_NAME}.tmp"
+        with tmp.open("w") as f:
+            json.dump(reports, f, indent=2, sort_keys=True)
+            f.write("\n")
+        tmp.replace(report_path)
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "sku_key": sku,
@@ -224,8 +241,10 @@ def dump_pinned_autotune_cache(
         "torch_version": torch_version,
         "triton_version": triton_version,
         "created_at": datetime.now(UTC).isoformat(),
+        "pick_rule": PICK_RULE,
         "file_count": len(files),
         "files": files,
+        "pick_report_count": len(reports),
     }
     write_manifest(dest, manifest)
     logger.info(
@@ -298,6 +317,80 @@ def install_pinned_autotune_cache(
     return installed
 
 
+def _load_best_config(path: Path) -> Any:
+    with path.open() as f:
+        return json.load(f)
+
+
+def compare_pin_packs(
+    pack_dir: Path | str,
+    ref_dir: Path | str,
+) -> dict[str, Any]:
+    """Compare two pin packs, ignoring dump-noise fields.
+
+    Returns:
+        A report with ``identical``, ``only_pack``, ``only_ref``, and
+        ``differing`` (each differing entry has ``path``, ``pack``, ``ref``).
+
+    """
+    pack = Path(pack_dir)
+    ref = Path(ref_dir)
+    pack_files: dict[str, Path] = {}
+    for path in iter_best_config_files(pack):
+        rel = _safe_relpath(path, pack)
+        if rel is not None:
+            pack_files[rel] = path
+    ref_files: dict[str, Path] = {}
+    for path in iter_best_config_files(ref):
+        rel = _safe_relpath(path, ref)
+        if rel is not None:
+            ref_files[rel] = path
+    only_pack = sorted(set(pack_files) - set(ref_files))
+    only_ref = sorted(set(ref_files) - set(pack_files))
+    differing: list[dict[str, Any]] = []
+    identical: list[str] = []
+    for rel in sorted(set(pack_files) & set(ref_files)):
+        pack_cfg = normalize_best_config(_load_best_config(pack_files[rel]))
+        ref_cfg = normalize_best_config(_load_best_config(ref_files[rel]))
+        if pack_cfg == ref_cfg:
+            identical.append(rel)
+        else:
+            differing.append({"path": rel, "pack": pack_cfg, "ref": ref_cfg})
+    return {
+        "pack": str(pack),
+        "ref": str(ref),
+        "identical": identical,
+        "only_pack": only_pack,
+        "only_ref": only_ref,
+        "differing": differing,
+    }
+
+
+def format_pack_diff(report: dict[str, Any]) -> str:
+    """Human-readable ``verify`` output."""
+    lines = [
+        f"pack: {report['pack']}",
+        f"ref:  {report['ref']}",
+        f"identical: {len(report['identical'])}",
+        f"only_pack: {len(report['only_pack'])}",
+        f"only_ref: {len(report['only_ref'])}",
+        f"differing: {len(report['differing'])}",
+    ]
+    for rel in report["only_pack"]:
+        lines.append(f"  only_pack {rel}")
+    for rel in report["only_ref"]:
+        lines.append(f"  only_ref {rel}")
+    for item in report["differing"]:
+        lines.append(f"  differ {item['path']}")
+        lines.append(f"    pack: {json.dumps(item['pack'], sort_keys=True)}")
+        lines.append(f"    ref:  {json.dumps(item['ref'], sort_keys=True)}")
+    return "\n".join(lines)
+
+
+def packs_match(report: dict[str, Any]) -> bool:
+    return not (report["only_pack"] or report["only_ref"] or report["differing"])
+
+
 def pin_dump_dir() -> Path | None:
     """Return the dump destination when ``VLLM_INDUCTOR_AUTOTUNE_PIN_DUMP`` is set."""
     raw = envs.VLLM_INDUCTOR_AUTOTUNE_PIN_DUMP
@@ -364,6 +457,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
         help="Destination inductor cache directory",
     )
+    verify = sub.add_parser(
+        "verify",
+        help="Compare a pin pack to a reference pack and print differing kernels",
+    )
+    verify.add_argument("--pack", required=True, help="Pack to check")
+    verify.add_argument("--ref", required=True, help="Reference pack")
     return parser
 
 
@@ -386,6 +485,10 @@ def main(argv: list[str] | None = None) -> int:
         if n == 0:
             return 1
         return 0
+    if args.command == "verify":
+        report = compare_pin_packs(args.pack, args.ref)
+        print(format_pack_diff(report))
+        return 0 if packs_match(report) else 1
     parser.error(f"unknown command {args.command}")
     return 2
 

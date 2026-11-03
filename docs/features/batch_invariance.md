@@ -285,12 +285,21 @@ and is the decoder ALT state (~1 in 24). vLLM now defaults
 `inductor_compile_config["dynamic_scale_rblock"] = False`, so those
 kernels stay on 1024 with no runtime benchmark.
 
-Multi-config kernels (for example rms_norm 4096 vs 2048) are still timed
-once at cold compile. Those winners live as `*.best_config` files under
-`TORCHINDUCTOR_CACHE_DIR`. Pin them per GPU SKU and load them before
-precompile so every autotuner is single-config or a cache hit. After
-warmup the worker logs `inductor runtime benchmarks: N (...)` and, under
-`VLLM_BATCH_INVARIANT=1`, **fails startup** if N is not 0.
+Multi-config kernels (for example rms_norm 4096 vs 2048) used to be
+timed once at cold compile. Near-tie wall-clock picks are not
+reproducible: separate dumps on the same A100 / SKU / code chose
+4096 vs 2048 and 18–28% of alone outputs changed. Under
+`VLLM_BATCH_INVARIANT` the pick is a fixed rule (largest `R0_BLOCK`,
+then other `*_BLOCK` keys, then warps / stages, then inductor list
+order). Invalid (inf) configs stay excluded. The `*.best_config` pack
+is a cache of that rule, not a source of numerics. A cold compile
+with no pack on any machine of the same SKU writes the same choices.
+After warmup the worker logs `inductor runtime benchmarks: N (...)`
+and, under `VLLM_BATCH_INVARIANT=1`, **fails startup** if N is not 0.
+A dump still benches so `pick_report.json` can show the rule vs the
+timed winner; the saved config is the rule pick. During that bench,
+static launchers stay open until the rule winner is known (this torch
+build otherwise closes every slower config mid-loop).
 
 Do not set `inductor_compile_config.deterministic=true` /
 `TORCHINDUCTOR_DETERMINISTIC`: that picks the second-largest RBLOCK and
@@ -326,12 +335,37 @@ unset VLLM_INDUCTOR_AUTOTUNE_ALLOW_BENCH VLLM_INDUCTOR_AUTOTUNE_PIN_DUMP
 export VLLM_INDUCTOR_AUTOTUNE_PIN_DIR=~/.cache/vllm/inductor_autotune_pins/a100-sm80
 VLLM_BATCH_INVARIANT=1 vllm serve <nemotron-3.5-transcribe-bf16> ...
 # log must contain: inductor runtime benchmarks: 0
+
+# 3) Two dumps of the same SKU must match (timing fields are ignored).
+.venv/bin/python -m vllm.compilation.inductor_autotune_pin verify \
+  --pack ~/.cache/vllm/inductor_autotune_pins/a100-sm80 \
+  --ref /path/to/reference/a100-sm80
 ```
 
 On L40S use `l40s-sm89` (the `sku` command prints it). Keep one pack per
 SKU; do not mix. If the compile cache is wiped, keep the pin pack — load
 still seeds `TORCHINDUCTOR_CACHE_DIR` before the new compile's
 precompile.
+
+Cold dumps that still pick by wall-clock are not a reference: the same
+pod produced different packs (pr6 c0 / pr7 c0 / pr7v3 c0 / pr16 a / mx)
+among near-tie R0_BLOCK 4096 vs 2048. After this rule, `verify` against a
+same-SKU pack must print `differing: 0`.
+
+#### Speed cost of the pick rule
+
+A100 dumps already treated 4096 vs 2048 as near-ties (timing noise
+flipped the winner). The rule therefore costs about 0% versus the timed
+winner on those kernels — within measurement noise, well under 1–2%.
+A dump still benches and writes `pick_report.json` (`picked_ms`,
+`timed_ms`, `rule_slower_pct`) so a later SKU can confirm.
+
+If a SKU ever shows the rule more than about 1–2% slower than the timed
+winner on a hot kernel, do **not** go back to `min(timings)`. Use a
+margin rule: keep the largest-R0_BLOCK default unless another config is
+more than X% faster (X ≈ 5, several times the observed dump noise).
+That stays deterministic in practice because near-ties stay on the
+default and only a clear, repeatable gap can switch.
 
 ### Speed cost (A100 BF16 Nemotron 3.5 Transcribe, measured)
 
@@ -376,7 +410,9 @@ When batch invariance is enabled, vLLM:
 7. Pins inductor kernel selection so fused add+RMSNorm reductions do not
    re-time R0_BLOCK 1024 vs 512 on every process, and so multi-config
    kernels reuse a SKU-keyed AutotuneCache pack instead of re-benchmarking
-   on every cold compile. See
+   on every cold compile. Under BI the dumped pack is the largest-R0_BLOCK
+   rule (not the timed winner) so two machines of the same SKU write the
+   same files. See
    [Inductor autotune pins](#inductor-autotune-pins-this-fork).
 8. Splits the LoRA shrink reduction into 8 fixed K chunks that are summed in a fixed order instead of with atomics
 9. For Mamba2, pins SSD Triton tiles and the decode SSU launch config so they
