@@ -521,7 +521,8 @@ def test_flex_wrapper_normalizes_runtime_guards():
         with torch.enable_grad():
             wrapped(query)
         opts = recorded["opts"]
-        assert recorded["dtype"] == torch.float32
+        # Serving flex no longer pins default_dtype; process default stays.
+        assert recorded["dtype"] == torch.float64
         assert recorded["inference"] is True
         assert isinstance(opts, dict)
         assert opts["FORCE_USE_FLEX_ATTENTION"] is True

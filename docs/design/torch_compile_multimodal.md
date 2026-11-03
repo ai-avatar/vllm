@@ -110,10 +110,12 @@ block_mask, inference_mode). Hitting the limit compiles
 `_flex_attention_hop_wrapper` with `backend=eager` (dense math,
 ~1.6-2x slower, different numerics) and the cached set then depends on
 request arrival order. vLLM raises the limit process-wide (torch 2.13
-`setattr` is thread-local) and inside the flex wrapper so encoder /
-diarizer threads see it with compile on or off, pins `default_dtype` /
-`inference_mode` / `kernel_options` on that path, warms the remaining
-variants after KV, and errors if an eager hop compile is observed.
+  `setattr` is thread-local) and inside the flex wrapper so encoder /
+  diarizer threads see it with compile on or off, pins `inference_mode`
+  / `kernel_options` on that path (not process-global `default_dtype`;
+  tensors pass `dtype=` and NeMo `_default_dtype` is RLock-wrapped),
+  warms the remaining variants after KV, and errors if an eager hop
+  compile is observed.
 Non-Nemotron models are unchanged when compile and graphs are off.
 Layer compile and graph capture are
 deferred until after KV allocation; a post-KV graph warmup then

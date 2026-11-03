@@ -179,9 +179,12 @@ in the decode or prefill batch.
   flex-decoding for clips shorter than 128 encoder frames. NeMo's
   import-time compiled flex is also guarded with compile *off*: dynamo
   limits are raised process-wide (and on the encoder / diarizer thread),
-  `kernel_options` / `default_dtype` / `inference_mode` are normalized
-  so the cache is not request-order dependent, and startup fails if
-  flex compiles `_flex_attention_hop_wrapper` with `backend=eager`.
+  `kernel_options` / `inference_mode` are normalized so the cache is
+  not request-order dependent, serving paths pass `dtype=` instead of
+  `set_default_dtype` (process default stays fp32; a process-wide
+  RLock wraps NeMo `_default_dtype` get/set/restore), and startup
+  fails if flex compiles `_flex_attention_hop_wrapper` with
+  `backend=eager`.
   Encoder CUDA
   graphs (`cudagraph_mm_encoder`, `VLLM_CUDAGRAPH_MM_ENCODER`, or
   `encoder_cuda_graphs`) are equivalent; they stay off unless any of

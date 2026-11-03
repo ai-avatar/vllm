@@ -176,13 +176,15 @@ def canonicalize_singleton_dim_strides(t: torch.Tensor) -> torch.Tensor:
 
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype):
-    """Sets the default torch dtype to the given dtype."""
-    old_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
+    """Sets the default torch dtype to the given dtype.
+
+    Holds the process-wide default_dtype lock for the whole get/set/restore
+    section so a concurrent NeMo / encoder pin cannot cross-restore.
+    """
+    from vllm.utils.default_dtype import locked_default_dtype
+
+    with locked_default_dtype(dtype):
         yield
-    finally:
-        torch.set_default_dtype(old_dtype)
 
 
 def _cgroup_cpu_limit() -> float | None:
