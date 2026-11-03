@@ -1398,13 +1398,12 @@ def warmup_speech_flex_variants(model: Any = None) -> int:
 def enable_speech_encoder_after_kv(model: nn.Module | None) -> SpeechEncoderWarmupStats:
     """Compile deferred layers, enable capture, and warm graph / flex variants.
 
-    Installs the process-wide default_dtype lock around NeMo
-    ``_default_dtype`` / ``torch.set_default_dtype``. Serving compile
-    and capture pass ``dtype=`` explicitly and do not change the
-    process default. Runs after KV allocation so this is not counted
-    as peak activation. Compile-only skips dummy graph captures.
-    Nemotron still warms flex variants with compile off so the dynamo
-    cache is not request-order dependent.
+    Installs the thread-local NeMo ``_default_dtype`` pin so serving
+    never calls ``set_default_dtype``. Compile and capture pass
+    ``dtype=`` explicitly. Runs after KV allocation so this is not
+    counted as peak activation. Compile-only skips dummy graph
+    captures. Nemotron still warms flex variants with compile off so
+    the dynamo cache is not request-order dependent.
     """
     from vllm.utils.default_dtype import install_default_dtype_guards
 
