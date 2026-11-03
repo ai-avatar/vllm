@@ -102,7 +102,20 @@ the SpeechLM hf config. vLLM compiles `perception.encoder` blocks itself
 `_get_flex_attention` so inductor cannot pick flex-decoding for inputs
 shorter than 128 encoder frames (10.24 s). The leftover
 `_use_flex_decoding` `Q < 128` guard is short-circuited so crossing
-128 frames does not recompile. Layer compile and graph capture are
+128 frames does not recompile. NeMo compiles `flex_attention` at
+import (`dynamic=True`); the ASR encoder and Sortformer diarizer share
+that object. It needs more dynamo guard variants than the default
+`recompile_limit` of 8 (default_dtype, batch, Q length, kernel_options,
+block_mask, inference_mode). Hitting the limit compiles
+`_flex_attention_hop_wrapper` with `backend=eager` (dense math,
+~1.6-2x slower, different numerics) and the cached set then depends on
+request arrival order. vLLM raises the limit process-wide (torch 2.13
+`setattr` is thread-local) and inside the flex wrapper so encoder /
+diarizer threads see it with compile on or off, pins `default_dtype` /
+`inference_mode` / `kernel_options` on that path, warms the remaining
+variants after KV, and errors if an eager hop compile is observed.
+Non-Nemotron models are unchanged when compile and graphs are off.
+Layer compile and graph capture are
 deferred until after KV allocation; a post-KV graph warmup then
 captures every `(batch, frame-bucket)` (under BI: batch 1 × buckets
 up to the audio cap) using `n_feat` from the perception preprocessor

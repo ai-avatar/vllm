@@ -29,6 +29,19 @@ preprocessor / encoder, then a compact long-audio window-graph set
 Compile-only skips dummy-audio warmup (dynamic shapes).
 Pending-compile state is stored on the unwrapped module:
 ``CUDAGraphWrapper.__getattr__`` forwards, but ``delattr`` does not.
+
+NeMo compiles ``flex_attention`` at import
+(``_flex_attention_compiled = torch.compile(flex_attention, dynamic=True)``)
+and both the ASR encoder and Sortformer diarizer share that object in the
+EngineCore process. It needs more dynamo guard variants than the default
+``recompile_limit`` of 8 (default_dtype fp32 vs bf16, batch 1 vs >=2,
+Q <128 vs >=128, kernel_options, block_mask size, inference_mode). Past
+the limit dynamo runs flex eagerly, which compiles
+``_flex_attention_hop_wrapper`` with ``backend=eager`` (dense math,
+~1.6-2x slower, different numerics). Which 8 variants stay cached then
+depends on request arrival order. Limits are applied process-wide and
+inside the flex wrapper so encoder / diarizer threads see them with
+compile on or off; a post-KV warmup fills the cache before serving.
 """
 
 from __future__ import annotations
@@ -56,7 +69,17 @@ _COMPILED_ATTR = "_vllm_mm_encoder_compiled"
 _FLEX_ISOLATED_ATTR = "_vllm_speech_encoder_flex_isolated"
 _RUNNER_PATCH_ATTR = "_vllm_speech_graph_patched"
 _PENDING_LAYERS_ATTR = "_vllm_speech_encoder_pending_compile"
-_DYNAMO_CONFIGURED = False
+_DYNAMO_DEFAULTS_RAISED = False
+_FLEX_COMPILE_HOOK_INSTALLED = False
+_SPEECH_FLEX_ACTIVE = False
+_SPEECH_FLEX_ACTIVE_ATTR = "_vllm_speech_flex_guarded"
+_FLEX_HOP_WRAPPER_NAME = "_flex_attention_hop_wrapper"
+_EAGER_HOP_COMPILES = 0
+_DYNAMO_LIMIT_NAMES = (
+    "recompile_limit",
+    "cache_size_limit",
+    "accumulated_recompile_limit",
+)
 # getattr on CUDAGraphWrapper forwards to .runnable; delattr does not.
 # Keep a side table so pending layers survive wrap/unwrap either way.
 _PENDING_LAYERS: weakref.WeakKeyDictionary[Any, list[nn.Module]] = (
@@ -66,10 +89,12 @@ _PENDING_LAYERS: weakref.WeakKeyDictionary[Any, list[nn.Module]] = (
 _NEMOTRON_SPEECH_ARCH_MARKERS = ("NeMoSpeechLM",)
 _NEMOTRON_SPEECH_MODEL_TYPES = ("nemo_speechlm",)
 
-# Windowed Sortformer / long-audio forwards hit more shape classes than
-# dynamo's default ``recompile_limit`` (8). Past the limit, compiled
-# blocks silently run eager code.
+# Windowed Sortformer / long-audio forwards plus ASR vs diar dtype /
+# inference_mode guards need more than dynamo's default recompile_limit
+# (8). Past the limit, NeMo's compiled flex runs eager dense attention.
 _SPEECH_ENCODER_RECOMPILE_LIMIT = 64
+_FLEX_WARMUP_BATCHES = (1, 2)
+_FLEX_WARMUP_FRAMES = (64, 128)
 # A100 80GB + ~63GB weights: a 16-row grid left ~1.1 GiB for KV.
 _MAX_ENCODER_GRAPH_BATCH = 8
 # 80 ms / encoder frame; 256-frame graph buckets.
@@ -251,16 +276,191 @@ class SpeechEncoderGraphFallback(RuntimeError):
     """Graph helper failed; ``__call__`` must return None (eager encode)."""
 
 
+class SpeechFlexEagerHopError(RuntimeError):
+    """NeMo compiled flex fell back to eager ``_flex_attention_hop_wrapper``."""
+
+
+def _model_hf_config(model: Any = None, vllm_config: Any = None) -> Any:
+    if vllm_config is not None:
+        model_config = getattr(vllm_config, "model_config", None)
+        if model_config is not None:
+            hf = getattr(model_config, "hf_config", None)
+            if hf is not None:
+                return hf
+    if model is None:
+        return None
+    inner = unwrap_speech_encoder_model(model)
+    for name in ("hf_config", "config"):
+        hf = getattr(inner, name, None)
+        if is_nemo_speechlm_config(hf):
+            return hf
+    return getattr(inner, "hf_config", None)
+
+
+def should_guard_speech_flex(model: Any = None, vllm_config: Any = None) -> bool:
+    """True for NeMo SpeechLM / Nemotron Transcribe (compile on or off)."""
+    if is_nemo_speechlm_config(_model_hf_config(model, vllm_config)):
+        return True
+    if model is None:
+        return False
+    if getattr(model, "_encoder_graphs", None) is not None:
+        return True
+    inner = unwrap_speech_encoder_model(model)
+    if getattr(inner, "_encoder_graphs", None) is not None:
+        return True
+    return bool(
+        getattr(model, _SPEECH_FLEX_ACTIVE_ATTR, False)
+        or getattr(inner, _SPEECH_FLEX_ACTIVE_ATTR, False)
+    )
+
+
+def _mark_speech_flex_model(model: Any) -> None:
+    global _SPEECH_FLEX_ACTIVE
+    _SPEECH_FLEX_ACTIVE = True
+    if model is None:
+        return
+    inner = unwrap_speech_encoder_model(model)
+    for obj in (model, inner):
+        with contextlib.suppress(Exception):
+            setattr(obj, _SPEECH_FLEX_ACTIVE_ATTR, True)
+
+
+def _is_dynamo_compiling() -> bool:
+    checker = getattr(torch.compiler, "is_dynamo_compiling", None)
+    if not callable(checker):
+        checker = getattr(getattr(torch, "_dynamo", None), "is_compiling", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+@contextlib.contextmanager
+def _flex_call_context(query: Any):
+    """Pin dtype + inference_mode so dynamo does not recompile on those guards.
+
+    Skipped while dynamo is tracing so encoder ``layer.compile`` still
+    inlines flex. Applied on the Python entry to NeMo's compiled wrapper
+    (compile-off production, encoder / diarizer threads).
+    """
+    if _is_dynamo_compiling():
+        yield
+        return
+    dtype = getattr(query, "dtype", None)
+    infer: Any
+    if torch.is_inference_mode_enabled():
+        infer = contextlib.nullcontext()
+    else:
+        infer = torch.inference_mode()
+    pin = _pin_default_dtype(dtype if isinstance(dtype, torch.dtype) else None)
+    with infer, pin:
+        yield
+
+
+def _is_flex_hop_wrapper(fn: Any) -> bool:
+    for obj in (fn, getattr(fn, "__wrapped__", None)):
+        if obj is None:
+            continue
+        name = getattr(obj, "__name__", "") or ""
+        qual = getattr(obj, "__qualname__", "") or ""
+        if _FLEX_HOP_WRAPPER_NAME in (name, qual):
+            return True
+        if name.endswith(_FLEX_HOP_WRAPPER_NAME):
+            return True
+    return False
+
+
+def _record_flex_eager_hop(backend: Any) -> None:
+    global _EAGER_HOP_COMPILES
+    _EAGER_HOP_COMPILES += 1
+    logger.error(
+        "flex_attention compiling %s (backend=%s, count=%d). Dynamo "
+        "recompile_limit was hit; this path is dense math attention "
+        "(~1.6-2x slower, different numerics).",
+        _FLEX_HOP_WRAPPER_NAME,
+        backend,
+        _EAGER_HOP_COMPILES,
+    )
+
+
+def speech_flex_eager_hop_compile_count() -> int:
+    """Times ``torch.compile(_flex_attention_hop_wrapper)`` was observed."""
+    return _EAGER_HOP_COMPILES
+
+
+def install_speech_flex_eager_hop_guard() -> None:
+    """Count / log eager ``_flex_attention_hop_wrapper`` compiles."""
+    global _FLEX_COMPILE_HOOK_INSTALLED
+    if _FLEX_COMPILE_HOOK_INSTALLED:
+        return
+    orig = torch.compile
+
+    @functools.wraps(orig)
+    def guarded_compile(model: Any = None, *args: Any, **kwargs: Any):
+        if callable(model) and _is_flex_hop_wrapper(model):
+            _record_flex_eager_hop(kwargs.get("backend"))
+            return orig(model, *args, **kwargs)
+        compiled = orig(model, *args, **kwargs)
+        if model is None and callable(compiled):
+
+            @functools.wraps(compiled)
+            def decorator(fn: Any, *dargs: Any, **dkwargs: Any):
+                if _is_flex_hop_wrapper(fn):
+                    _record_flex_eager_hop(kwargs.get("backend"))
+                return compiled(fn, *dargs, **dkwargs)
+
+            return decorator
+        return compiled
+
+    torch.compile = guarded_compile  # type: ignore[misc]
+    _FLEX_COMPILE_HOOK_INSTALLED = True
+
+
+def _raise_dynamo_limit(config: Any, name: str, limit: int) -> None:
+    entries = getattr(config, "_config", None)
+    if isinstance(entries, dict) and name in entries:
+        entry = entries[name]
+        if getattr(entry, "alias", None) is None:
+            default = getattr(entry, "default", None)
+            if isinstance(default, int) and default < limit:
+                entry.default = limit
+    if not hasattr(config, name):
+        return
+    current = getattr(config, name)
+    if isinstance(current, int) and current < limit:
+        setattr(config, name, limit)
+
+
+def guard_speech_flex_attention(model: Any = None) -> None:
+    """Isolate NeMo flex, raise dynamo limits, hook eager hop fallback."""
+    isolate_flex_attention_from_compile()
+    configure_speech_encoder_dynamo()
+    install_speech_flex_eager_hop_guard()
+    _mark_speech_flex_model(model)
+
+
 def _force_flex_attention_kernel(fn: Any) -> Any:
-    """Wrap ``fn`` so inductor cannot pick flex-decoding for short Q."""
+    """Wrap ``fn`` so inductor cannot pick flex-decoding for short Q.
+
+    Also reapplies dynamo limits on the calling thread and, when not
+    tracing, pins ``default_dtype`` to ``query.dtype`` and runs under
+    ``inference_mode`` so ASR (fp32) / diar (bf16) and autograd vs
+    inference_mode do not explode the compiled-flex guard set. Always
+    sets ``kernel_options`` so None vs set is not a variant.
+    """
     if fn is None or getattr(fn, _FLEX_ISOLATED_ATTR, False):
         return fn
 
     def wrapped(*args: Any, **kwargs: Any):
+        configure_speech_encoder_dynamo()
         opts = dict(kwargs.get("kernel_options") or {})
         opts["FORCE_USE_FLEX_ATTENTION"] = True
         kwargs["kernel_options"] = opts
-        return fn(*args, **kwargs)
+        query = args[0] if args else kwargs.get("query")
+        with _flex_call_context(query):
+            return fn(*args, **kwargs)
 
     with contextlib.suppress(Exception):
         wrapped = functools.update_wrapper(wrapped, fn)
@@ -335,12 +535,15 @@ def isolate_flex_attention_from_compile() -> bool:
     is short-circuited so crossing 128 frames does not recompile.
 
     Always re-scans loaded modules so a late NeMo import is still
-    patched.
+    patched. The wrapper also reapplies dynamo limits on the calling
+    thread and normalizes kernel_options / default_dtype /
+    inference_mode so the compiled-flex guard set does not explode.
 
     Returns:
         True when the global op was wrapped, or already wrapped.
 
     """
+    install_speech_flex_eager_hop_guard()
     _patch_flex_decoding_guard()
     try:
         import torch.nn.attention.flex_attention as flex_mod
@@ -416,25 +619,28 @@ def isolate_flex_attention_from_compile() -> bool:
 
 
 def configure_speech_encoder_dynamo() -> None:
-    """Raise dynamo recompile limits for variable encoder window shapes."""
-    global _DYNAMO_CONFIGURED
-    if _DYNAMO_CONFIGURED:
-        return
+    """Raise dynamo recompile limits in this thread and process-wide.
+
+    torch 2.13+ stores ``config`` user overrides in a ContextVar, so
+    ``setattr(torch._dynamo.config, ...)`` does not reach the encoder /
+    diarizer threads. Mutating ``_config[name].default`` is honoured
+    when those threads have no override. Called from the flex wrapper
+    on every encoder / diarizer invocation as well as at load time.
+    """
+    global _DYNAMO_DEFAULTS_RAISED
     dynamo = getattr(torch, "_dynamo", None)
     if dynamo is None or not hasattr(dynamo, "config"):
         return
     config = dynamo.config
-    for name in (
-        "recompile_limit",
-        "cache_size_limit",
-        "accumulated_recompile_limit",
-    ):
-        if not hasattr(config, name):
-            continue
-        current = getattr(config, name)
-        if isinstance(current, int) and current < _SPEECH_ENCODER_RECOMPILE_LIMIT:
-            setattr(config, name, _SPEECH_ENCODER_RECOMPILE_LIMIT)
-    _DYNAMO_CONFIGURED = True
+    for name in _DYNAMO_LIMIT_NAMES:
+        _raise_dynamo_limit(config, name, _SPEECH_ENCODER_RECOMPILE_LIMIT)
+    if not _DYNAMO_DEFAULTS_RAISED:
+        logger.info_once(
+            "Raised torch._dynamo recompile/cache limits to %d process-wide "
+            "for NeMo _flex_attention_compiled (speech encoder + diarizer).",
+            _SPEECH_ENCODER_RECOMPILE_LIMIT,
+        )
+    _DYNAMO_DEFAULTS_RAISED = True
 
 
 def speech_encoder_layer_compile_kwargs() -> dict[str, Any]:
@@ -964,6 +1170,8 @@ class SpeechEncoderWarmupStats:
     captured: int = 0
     long_captured: int = 0
     failed: int = 0
+    flex_warmed: int = 0
+    eager_hop_compiles: int = 0
 
 
 def _warmup_graphs(runner: Any, model: Any) -> SpeechEncoderWarmupStats:
@@ -1112,12 +1320,119 @@ def warmup_speech_encoder(model: nn.Module | None) -> SpeechEncoderWarmupStats:
     return stats
 
 
+def _speech_flex_modules(model: Any) -> list[Any]:
+    inner = unwrap_speech_encoder_model(model)
+    perception = getattr(inner, "perception", None)
+    modules: list[Any] = []
+    for obj in (
+        getattr(perception, "encoder", None),
+        getattr(perception, "diarizer", None),
+        getattr(perception, "sortformer", None),
+        getattr(inner, "diarizer", None),
+        getattr(inner, "sortformer", None),
+    ):
+        if obj is not None and obj not in modules:
+            modules.append(obj)
+    if perception is not None and isinstance(perception, nn.Module):
+        for name, child in perception.named_children():
+            lname = name.lower()
+            if ("sortformer" in lname or "diar" in lname) and child not in modules:
+                modules.append(child)
+    return modules
+
+
+def _try_call_speech_encoder(
+    encoder: Any,
+    batch: int,
+    n_feat: int,
+    frames: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> bool:
+    processed = torch.zeros(batch, n_feat, frames, device=device, dtype=dtype)
+    length = torch.full((batch,), frames, device=device, dtype=torch.int64)
+    attempts: tuple[tuple[tuple[Any, ...], dict[str, Any]], ...] = (
+        ((), {"audio_signal": processed, "length": length}),
+        ((), {"processed_signal": processed, "processed_signal_length": length}),
+        ((processed, length), {}),
+    )
+    for args, kwargs in attempts:
+        try:
+            encoder(*args, **kwargs)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def warmup_speech_flex_variants(model: Any = None) -> int:
+    """Compile every known flex guard variant through the real encoder.
+
+    NeMo's ``_flex_attention_compiled`` guards ``score_mod`` by identity,
+    so a synthetic flex call would not populate the serving cache. Dummy
+    encoder / diarizer forwards cover default_dtype (fp32 ASR vs bf16
+    diar), batch 1 vs 2, and Q <128 vs >=128. The flex wrapper forces
+    kernel_options and inference_mode. Arrival order then cannot pick
+    which variants occupy the dynamo cache.
+
+    Raises:
+        SpeechFlexEagerHopError: A warmup call compiled
+            ``_flex_attention_hop_wrapper`` (eager dense attention).
+
+    """
+    guard_speech_flex_attention(model)
+    if model is None:
+        return 0
+    device = _model_device(model)
+    if device.type != "cuda":
+        logger.info("Skipping speech flex-variant warmup (device=%s).", device)
+        return 0
+    inner = unwrap_speech_encoder_model(model)
+    n_feat = speech_encoder_n_feat(inner) or 128
+    dtypes = [torch.float32, torch.bfloat16]
+    if isinstance(inner, nn.Module):
+        mod_dtype = _module_floating_dtype(inner)
+        if mod_dtype is not None and mod_dtype not in dtypes:
+            dtypes.append(mod_dtype)
+    warmed = 0
+    started = time.perf_counter()
+    hops_before = speech_flex_eager_hop_compile_count()
+    for module in _speech_flex_modules(inner):
+        for dtype in dtypes:
+            with _pin_default_dtype(dtype), torch.inference_mode():
+                for batch in _FLEX_WARMUP_BATCHES:
+                    for frames in _FLEX_WARMUP_FRAMES:
+                        if _try_call_speech_encoder(
+                            module, batch, n_feat, frames, dtype, device
+                        ):
+                            warmed += 1
+    hops = speech_flex_eager_hop_compile_count() - hops_before
+    logger.info(
+        "Speech flex-variant warmup ran %d encoder/diar call(s) in %.2f s "
+        "(%s eager compiles=%d).",
+        warmed,
+        time.perf_counter() - started,
+        _FLEX_HOP_WRAPPER_NAME,
+        hops,
+    )
+    if hops:
+        raise SpeechFlexEagerHopError(
+            "NeMo flex_attention fell back to compiling "
+            f"{_FLEX_HOP_WRAPPER_NAME} with backend=eager ({hops} time(s)). "
+            "Dynamo recompile_limit was hit; later variants run dense math "
+            "attention (~1.6-2x slower, different numerics)."
+        )
+    return warmed
+
+
 def enable_speech_encoder_after_kv(model: nn.Module | None) -> SpeechEncoderWarmupStats:
-    """Compile deferred layers, enable capture, and warm graph buckets.
+    """Compile deferred layers, enable capture, and warm graph / flex variants.
 
     Pins ``default_dtype`` across compile + capture so dynamo does not
     recompile on ``GLOBAL_STATE``. Runs after KV allocation so this is
-    not counted as peak activation. Compile-only skips dummy encodes.
+    not counted as peak activation. Compile-only skips dummy graph
+    captures. Nemotron still warms flex variants with compile off so
+    the dynamo cache is not request-order dependent.
     """
     if model is None:
         return SpeechEncoderWarmupStats()
@@ -1125,10 +1440,17 @@ def enable_speech_encoder_after_kv(model: nn.Module | None) -> SpeechEncoderWarm
     dtype = None
     if isinstance(inner, nn.Module):
         dtype = _module_floating_dtype(inner)
+    guard = should_guard_speech_flex(model) or _SPEECH_FLEX_ACTIVE
     with _pin_default_dtype(dtype):
+        if guard:
+            guard_speech_flex_attention(model)
         compile_pending_speech_encoder_layers(model)
         enable_speech_encoder_graph_capture(model)
-        return warmup_speech_encoder(model)
+        stats = warmup_speech_encoder(model)
+        if guard:
+            stats.flex_warmed = warmup_speech_flex_variants(model)
+            stats.eager_hop_compiles = speech_flex_eager_hop_compile_count()
+        return stats
 
 
 def maybe_compile_speech_mm_encoder(
@@ -1141,6 +1463,10 @@ def maybe_compile_speech_mm_encoder(
     deferred to the plugin: vLLM compiles the same blocks after forcing
     the non-decoding flex kernel, including when graphs are on.
 
+    Nemotron / SpeechLM always isolates flex and raises dynamo limits,
+    including compile-off: NeMo's import-time compiled flex still runs.
+    Non-Nemotron models are unchanged when compile and graphs are off.
+
     When ``defer`` is True (model runners), ``layer.compile`` runs after
     KV allocation so inductor workspaces are not counted as peak
     activation.
@@ -1149,9 +1475,8 @@ def maybe_compile_speech_mm_encoder(
     """
     configure_speech_encoder_graphs(model, vllm_config)
     want_compile = bool(vllm_config.compilation_config.compile_mm_encoder)
-    if want_compile or getattr(model, "_encoder_graphs", None) is not None:
-        isolate_flex_attention_from_compile()
-        configure_speech_encoder_dynamo()
+    if want_compile or should_guard_speech_flex(model, vllm_config):
+        guard_speech_flex_attention(model)
 
     if not want_compile:
         return 0

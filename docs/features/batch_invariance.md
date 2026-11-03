@@ -176,7 +176,13 @@ in the decode or prefill batch.
   `compile_mm_encoder` / `VLLM_COMPILE_MM_ENCODER=1` compiles
   `perception.encoder` blocks with dynamic shapes. Flex stays in that
   graph with `FORCE_USE_FLEX_ATTENTION` so inductor cannot pick
-  flex-decoding for clips shorter than 128 encoder frames. Encoder CUDA
+  flex-decoding for clips shorter than 128 encoder frames. NeMo's
+  import-time compiled flex is also guarded with compile *off*: dynamo
+  limits are raised process-wide (and on the encoder / diarizer thread),
+  `kernel_options` / `default_dtype` / `inference_mode` are normalized
+  so the cache is not request-order dependent, and startup fails if
+  flex compiles `_flex_attention_hop_wrapper` with `backend=eager`.
+  Encoder CUDA
   graphs (`cudagraph_mm_encoder`, `VLLM_CUDAGRAPH_MM_ENCODER`, or
   `encoder_cuda_graphs`) are equivalent; they stay off unless any of
   those three is set. Under BI the default graph batch grid is `(1,)`,
