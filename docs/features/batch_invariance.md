@@ -182,6 +182,10 @@ in the decode or prefill batch.
   `kernel_options` / `default_dtype` / `inference_mode` are normalized
   so the cache is not request-order dependent, and startup fails if
   flex compiles `_flex_attention_hop_wrapper` with `backend=eager`.
+  CTC timestamp prepare (`nemo-ctc-prepare`) stays off the step loop so
+  it can still overlap decode; it shares a process lock with the main
+  encoder around encode / flex / `create_block_mask` so
+  `torch.fx.traceback.current_meta` is not mutated from two threads.
   Encoder CUDA
   graphs (`cudagraph_mm_encoder`, `VLLM_CUDAGRAPH_MM_ENCODER`, or
   `encoder_cuda_graphs`) are equivalent; they stay off unless any of

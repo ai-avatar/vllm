@@ -42,6 +42,10 @@ the limit dynamo runs flex eagerly, which compiles
 depends on request arrival order. Limits are applied process-wide and
 inside the flex wrapper so encoder / diarizer threads see them with
 compile on or off; a post-KV warmup fills the cache before serving.
+CTC prepare (``nemo-ctc-prepare``) stays off the step loop so it can
+overlap decode; encode / flex / ``create_block_mask`` share one process
+lock so ``torch.fx.traceback.current_meta`` is not mutated from two
+threads.
 """
 
 from __future__ import annotations
@@ -59,6 +63,10 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.utils.speech_encode_serialize import (
+    install_speech_encode_serialize,
+    speech_encode_section,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -454,13 +462,14 @@ def _force_flex_attention_kernel(fn: Any) -> Any:
         return fn
 
     def wrapped(*args: Any, **kwargs: Any):
-        configure_speech_encoder_dynamo()
-        opts = dict(kwargs.get("kernel_options") or {})
-        opts["FORCE_USE_FLEX_ATTENTION"] = True
-        kwargs["kernel_options"] = opts
-        query = args[0] if args else kwargs.get("query")
-        with _flex_call_context(query):
-            return fn(*args, **kwargs)
+        with speech_encode_section():
+            configure_speech_encoder_dynamo()
+            opts = dict(kwargs.get("kernel_options") or {})
+            opts["FORCE_USE_FLEX_ATTENTION"] = True
+            kwargs["kernel_options"] = opts
+            query = args[0] if args else kwargs.get("query")
+            with _flex_call_context(query):
+                return fn(*args, **kwargs)
 
     with contextlib.suppress(Exception):
         wrapped = functools.update_wrapper(wrapped, fn)
@@ -544,6 +553,7 @@ def isolate_flex_attention_from_compile() -> bool:
 
     """
     install_speech_flex_eager_hop_guard()
+    install_speech_encode_serialize()
     _patch_flex_decoding_guard()
     try:
         import torch.nn.attention.flex_attention as flex_mod
@@ -575,7 +585,8 @@ def isolate_flex_attention_from_compile() -> bool:
                 if kwargs.get("device") is None:
                     with contextlib.suppress(Exception):
                         kwargs["device"] = torch.device("cuda")
-                return create_mask(*args, **kwargs)
+                with speech_encode_section():
+                    return create_mask(*args, **kwargs)
 
             setattr(_create_mask_on_gpu, _FLEX_ISOLATED_ATTR, True)
             flex_mod.create_block_mask = _create_mask_on_gpu
@@ -615,6 +626,7 @@ def isolate_flex_attention_from_compile() -> bool:
                 )
         except Exception:
             continue
+    install_speech_encode_serialize()
     return wrapped_global
 
 
