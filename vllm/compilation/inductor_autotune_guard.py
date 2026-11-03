@@ -6,6 +6,14 @@ Wraps class methods on ``CachingAutotuner`` (never instance bound methods or
 ``AutotuneCache.save``, which get pickled into static autotuners). Under
 ``VLLM_BATCH_INVARIANT`` startup fails if any benchmark ran after warmup
 unless ``VLLM_INDUCTOR_AUTOTUNE_ALLOW_BENCH=1``.
+
+This torch build's ``benchmark_all_configs`` closes the static launcher
+of every config slower than the running best *during* the bench loop.
+The BI pick re-ranks afterwards, so the rule winner may already be
+closed (``AssertionError: self.function is not None``). Under BI the
+wrapper suppresses ``_close_static_launcher`` for that loop;
+``autotune_to_one_config`` then releases losers via
+``_release_static_launchers_except``.
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ import vllm.envs as envs
 from vllm.compilation.inductor_autotune_pick import (
     maybe_rewrite_timings,
     reset_pick_reports,
+    should_pick_deterministic,
 )
 from vllm.logger import init_logger
 
@@ -76,6 +85,9 @@ def _wrap_method(cls: type, name: str, *, count: bool) -> None:
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         if name == "autotune_to_one_config":
             _in_autotune.active = True
+        suppress_close = name == "benchmark_all_configs" and should_pick_deterministic()
+        if suppress_close:
+            _in_autotune.suppress_close = True
         t0 = time.perf_counter()
         try:
             result = original(self, *args, **kwargs)
@@ -83,6 +95,8 @@ def _wrap_method(cls: type, name: str, *, count: bool) -> None:
                 result = maybe_rewrite_timings(self, result)
             return result
         finally:
+            if suppress_close:
+                _in_autotune.suppress_close = False
             if count and (
                 name != "benchmark_all_configs"
                 or not getattr(_in_autotune, "active", False)
@@ -97,10 +111,28 @@ def _wrap_method(cls: type, name: str, *, count: bool) -> None:
     setattr(cls, name, wrapped)
 
 
+def _wrap_close_static_launcher(cls: type) -> None:
+    """No-op ``_close_static_launcher`` while a BI bench loop is re-ranking."""
+    original = getattr(cls, "_close_static_launcher", None)
+    if original is None or getattr(original, "_vllm_inductor_bench_guard", False):
+        return
+
+    def wrapped(launcher: Any) -> Any:
+        if getattr(_in_autotune, "suppress_close", False):
+            return None
+        return original(launcher)
+
+    wrapped._vllm_inductor_bench_guard = True  # type: ignore[attr-defined]
+    wrapped.__name__ = getattr(original, "__name__", "_close_static_launcher")
+    wrapped.__wrapped__ = original  # type: ignore[attr-defined]
+    cls._close_static_launcher = staticmethod(wrapped)  # type: ignore[attr-defined]
+
+
 def wrap_autotuner_class(cls: type) -> None:
-    """Wrap ``autotune_to_one_config`` / ``benchmark_all_configs`` on ``cls``."""
+    """Wrap autotune pick / bench / static-launcher close on ``cls``."""
     _wrap_method(cls, "autotune_to_one_config", count=True)
     _wrap_method(cls, "benchmark_all_configs", count=True)
+    _wrap_close_static_launcher(cls)
 
 
 def install() -> None:

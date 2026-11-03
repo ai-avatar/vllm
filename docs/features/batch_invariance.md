@@ -297,7 +297,9 @@ with no pack on any machine of the same SKU writes the same choices.
 After warmup the worker logs `inductor runtime benchmarks: N (...)`
 and, under `VLLM_BATCH_INVARIANT=1`, **fails startup** if N is not 0.
 A dump still benches so `pick_report.json` can show the rule vs the
-timed winner; the saved config is the rule pick.
+timed winner; the saved config is the rule pick. During that bench,
+static launchers stay open until the rule winner is known (this torch
+build otherwise closes every slower config mid-loop).
 
 Do not set `inductor_compile_config.deterministic=true` /
 `TORCHINDUCTOR_DETERMINISTIC`: that picks the second-largest RBLOCK and

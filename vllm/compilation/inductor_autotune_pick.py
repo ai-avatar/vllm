@@ -11,7 +11,9 @@ Under ``VLLM_BATCH_INVARIANT`` the pick ignores wall-clock and uses a
 fixed order: largest ``R0_BLOCK``, then other ``*_BLOCK`` keys, then
 warps / stages, then inductor's original list order. Invalid (inf)
 configs stay excluded. The pack is then a cache of that rule, not a
-source of numerics.
+source of numerics. The bench-loop wrapper keeps static launchers
+open until ``autotune_to_one_config`` releases the losers (this torch
+build otherwise closes every config slower than the running best).
 
 Do not use inductor ``deterministic=true``: that picks the
 second-largest RBLOCK and is a different (broken) numeric path.

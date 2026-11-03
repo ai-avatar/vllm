@@ -227,6 +227,97 @@ def test_guard_rewrites_autotune_pick_under_bi(monkeypatch: pytest.MonkeyPatch):
     assert winner.config.kwargs["R0_BLOCK"] == 4096
 
 
+class _StaticLauncher:
+    """Mimic a static Triton launcher that ``close()`` nulls ``function``."""
+
+    def __init__(self, r0: int, *, ms: float):
+        self.config = _Cfg(r0)
+        self._is_static = True
+        self.ms = ms
+        self.function: object | None = object()
+        self.closed = False
+
+
+def _close_static_like_inductor(launcher: _StaticLauncher) -> None:
+    launcher.closed = True
+    launcher.function = None
+
+
+class _CloseDuringBenchTuner:
+    """Inductor closes every launcher slower than the running best mid-loop."""
+
+    inductor_meta = {"kernel_name": "rms_norm"}
+
+    def __init__(self) -> None:
+        # 2048 is the timed winner; 4096 is the BI rule pick.
+        self.fast_small = _StaticLauncher(2048, ms=0.0722)
+        self.slow_big = _StaticLauncher(4096, ms=0.0725)
+        self.launchers = [self.fast_small, self.slow_big]
+
+    @staticmethod
+    def _close_static_launcher(launcher: _StaticLauncher) -> None:
+        _close_static_like_inductor(launcher)
+
+    def benchmark_all_configs(self) -> dict[_StaticLauncher, float]:
+        timings: dict[_StaticLauncher, float] = {}
+        best_launcher: _StaticLauncher | None = None
+        best_timing = float("inf")
+        for launcher in self.launchers:
+            timings[launcher] = launcher.ms
+            if best_launcher is None or launcher.ms < best_timing:
+                if best_launcher is not None:
+                    self._close_static_launcher(best_launcher)
+                best_launcher = launcher
+                best_timing = launcher.ms
+            else:
+                self._close_static_launcher(launcher)
+        return timings
+
+    def autotune_to_one_config(self) -> _StaticLauncher:
+        timings = self.benchmark_all_configs()
+        best = min(timings, key=timings.get)
+        if best.function is None:
+            raise AssertionError("self.function is not None")
+        return best
+
+
+def test_bi_bench_keeps_slower_rule_winner_open(monkeypatch: pytest.MonkeyPatch):
+    """Fails on 93063f99: rewrite runs after inductor already closed 4096."""
+    reset()
+    reset_pick_reports()
+    monkeypatch.setattr(
+        "vllm.compilation.inductor_autotune_pick.envs.VLLM_BATCH_INVARIANT",
+        True,
+    )
+    wrap_autotuner_class(_CloseDuringBenchTuner)
+    tuner = _CloseDuringBenchTuner()
+    winner = tuner.autotune_to_one_config()
+    assert winner is tuner.slow_big
+    assert winner.config.kwargs["R0_BLOCK"] == 4096
+    assert winner.function is not None
+    assert winner.closed is False
+    assert tuner.fast_small.function is not None
+    assert tuner.fast_small.closed is False
+
+
+def test_without_bi_bench_still_closes_timed_losers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    reset()
+    reset_pick_reports()
+    monkeypatch.setattr(
+        "vllm.compilation.inductor_autotune_pick.envs.VLLM_BATCH_INVARIANT",
+        False,
+    )
+    wrap_autotuner_class(_CloseDuringBenchTuner)
+    tuner = _CloseDuringBenchTuner()
+    winner = tuner.autotune_to_one_config()
+    assert winner is tuner.fast_small
+    assert winner.function is not None
+    assert tuner.slow_big.closed is True
+    assert tuner.slow_big.function is None
+
+
 def test_verify_ignores_time_taken_ms(tmp_path: Path):
     pack = tmp_path / "pack"
     ref = tmp_path / "ref"
