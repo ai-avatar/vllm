@@ -24,8 +24,8 @@ from typing import Any
 
 import vllm.envs as envs
 from vllm.compilation.inductor_autotune_pick import (
+    kernel_name,
     maybe_rewrite_timings,
-    reset_pick_reports,
     should_pick_deterministic,
 )
 from vllm.logger import init_logger
@@ -43,10 +43,13 @@ def is_installed() -> bool:
 
 
 def reset() -> None:
-    """Drop recorded events. Call at the start of worker warmup."""
+    """Drop recorded bench events. Call at the start of worker warmup.
+
+    Does not clear pick reports: compile records them before this reset,
+    and the pin dump runs after warmup.
+    """
     with _lock:
         _events.clear()
-    reset_pick_reports()
 
 
 def recorded_events() -> list[tuple[str, float]]:
@@ -64,12 +67,7 @@ def format_summary(events: list[tuple[str, float]] | None = None) -> str:
 
 
 def _kernel_name(autotuner: Any) -> str:
-    meta = getattr(autotuner, "inductor_meta", None) or {}
-    name = meta.get("kernel_name") if isinstance(meta, dict) else None
-    if isinstance(name, str) and name:
-        return name
-    fn = getattr(autotuner, "fn", None)
-    return str(getattr(fn, "__name__", type(autotuner).__name__))
+    return kernel_name(autotuner)
 
 
 def record(autotuner: Any, duration_s: float) -> None:

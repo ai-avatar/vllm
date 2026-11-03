@@ -31,6 +31,14 @@ logger = init_logger(__name__)
 
 PICK_RULE = "largest_rblock"
 _IGNORE_CONFIG_KEYS = frozenset({"time_taken_ms", "triton_cache_hash"})
+_PLACEHOLDER_KERNEL_NAMES = frozenset(
+    {
+        "Placeholder.DESCRIPTIVE_NAME",
+        "Placeholder.KERNEL_NAME",
+        "DESCRIPTIVE_NAME",
+        "KERNEL_NAME",
+    }
+)
 
 _lock = threading.Lock()
 _reports: list[dict[str, Any]] = []
@@ -54,6 +62,31 @@ def pick_reports() -> list[dict[str, Any]]:
 def record_pick_report(report: dict[str, Any]) -> None:
     with _lock:
         _reports.append(dict(report))
+
+
+def _is_placeholder_kernel_name(name: str | None) -> bool:
+    if not name or not isinstance(name, str):
+        return True
+    return name in _PLACEHOLDER_KERNEL_NAMES or name.startswith("Placeholder.")
+
+
+def kernel_name(autotuner: Any) -> str:
+    """Human kernel name; skip inductor ``Placeholder.DESCRIPTIVE_NAME``."""
+    meta = getattr(autotuner, "inductor_meta", None) or {}
+    meta_name = meta.get("kernel_name") if isinstance(meta, dict) else None
+    fn = getattr(autotuner, "fn", None)
+    fn_name = getattr(fn, "__name__", None)
+    if isinstance(meta_name, str) and not _is_placeholder_kernel_name(meta_name):
+        return meta_name
+    if (
+        isinstance(fn_name, str)
+        and fn_name
+        and not _is_placeholder_kernel_name(fn_name)
+    ):
+        return fn_name
+    if isinstance(meta_name, str) and meta_name:
+        return meta_name
+    return str(fn_name or type(autotuner).__name__)
 
 
 def _config_kwargs(config: Any) -> dict[str, Any]:
@@ -145,13 +178,7 @@ def maybe_rewrite_timings(
     slower_pct = None
     if timed_ms > 0:
         slower_pct = (rule_ms - timed_ms) / timed_ms * 100.0
-    kernel = None
-    meta = getattr(autotuner, "inductor_meta", None) or {}
-    if isinstance(meta, dict):
-        kernel = meta.get("kernel_name")
-    if not kernel:
-        fn = getattr(autotuner, "fn", None)
-        kernel = getattr(fn, "__name__", type(autotuner).__name__)
+    kernel = kernel_name(autotuner)
     report = {
         "kernel": kernel,
         "pick_rule": PICK_RULE,

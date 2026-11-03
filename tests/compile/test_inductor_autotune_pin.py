@@ -18,6 +18,7 @@ from vllm.compilation.inductor_autotune_guard import (
 from vllm.compilation.inductor_autotune_pick import (
     PICK_RULE,
     config_sort_key,
+    kernel_name,
     maybe_rewrite_timings,
     normalize_best_config,
     pick_deterministic_config,
@@ -367,6 +368,58 @@ def test_dump_records_pick_rule(tmp_path: Path):
     pack = tmp_path / "pack"
     manifest = dump_pinned_autotune_cache(cache, pack, sku_key="a100-sm80")
     assert manifest["pick_rule"] == PICK_RULE
+
+
+def test_pick_report_survives_warmup_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Compile records picks before gpu_worker warmup reset(); dump is after."""
+    reset_pick_reports()
+    monkeypatch.setattr(
+        "vllm.compilation.inductor_autotune_pick.envs.VLLM_BATCH_INVARIANT",
+        True,
+    )
+    big = _Launcher(_Cfg(4096))
+    small = _Launcher(_Cfg(2048))
+    maybe_rewrite_timings(
+        type(
+            "T",
+            (),
+            {
+                "inductor_meta": {"kernel_name": "Placeholder.DESCRIPTIVE_NAME"},
+                "fn": type("F", (), {"__name__": "rms_norm_t_0"})(),
+            },
+        )(),
+        {small: 0.0722, big: 0.0725},
+    )
+    assert pick_reports()
+    reset()
+    reports = pick_reports()
+    assert len(reports) == 1
+    assert reports[0]["kernel"] == "rms_norm_t_0"
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "k.best_config").write_text('{"R0_BLOCK": 4096}\n')
+    pack = tmp_path / "pack"
+    manifest = dump_pinned_autotune_cache(cache, pack, sku_key="a100-sm80")
+    assert manifest["pick_report_count"] == 1
+    written = (pack / "pick_report.json").read_text()
+    assert "rms_norm_t_0" in written
+    assert "Placeholder.DESCRIPTIVE_NAME" not in written
+
+
+def test_kernel_name_skips_inductor_placeholder():
+    tuner = type(
+        "T",
+        (),
+        {
+            "inductor_meta": {"kernel_name": "Placeholder.DESCRIPTIVE_NAME"},
+            "fn": type("F", (), {"__name__": "triton_red_fused_rms_norm_t_0"})(),
+        },
+    )()
+    assert kernel_name(tuner) == "triton_red_fused_rms_norm_t_0"
+    real = type("T", (), {"inductor_meta": {"kernel_name": "rms_norm"}})()
+    assert kernel_name(real) == "rms_norm"
 
 
 class _FakeAutotuner:
