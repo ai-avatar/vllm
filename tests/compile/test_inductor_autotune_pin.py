@@ -15,16 +15,27 @@ from vllm.compilation.inductor_autotune_guard import (
     reset,
     wrap_autotuner_class,
 )
+from vllm.compilation.inductor_autotune_pick import (
+    PICK_RULE,
+    config_sort_key,
+    maybe_rewrite_timings,
+    normalize_best_config,
+    pick_deterministic_config,
+    pick_reports,
+    reset_pick_reports,
+    should_pick_deterministic,
+)
 from vllm.compilation.inductor_autotune_pin import (
+    compare_pin_packs,
     current_sku_key,
     dump_pinned_autotune_cache,
+    format_pack_diff,
     install_pinned_autotune_cache,
+    packs_match,
     pin_dump_dir,
     resolve_pin_pack_dir,
 )
-from vllm.compilation.inductor_autotune_pin import (
-    main as pin_main,
-)
+from vllm.compilation.inductor_autotune_pin import main as pin_main
 
 
 @pytest.mark.parametrize(
@@ -121,6 +132,150 @@ def test_cli_dump_install(tmp_path: Path):
     assert pin_main(["dump", "--cache-dir", str(cache), "--output", str(pack)]) == 0
     assert pin_main(["install", "--source", str(pack), "--cache-dir", str(dest)]) == 0
     assert (dest / "k.best_config").is_file()
+
+
+class _Cfg:
+    def __init__(
+        self,
+        r0: int | None,
+        num_warps: int = 4,
+        num_stages: int = 1,
+        extra: dict | None = None,
+    ):
+        self.kwargs = dict(extra or {})
+        if r0 is not None:
+            self.kwargs["R0_BLOCK"] = r0
+        self.num_warps = num_warps
+        self.num_stages = num_stages
+
+
+class _Launcher:
+    def __init__(self, config: _Cfg):
+        self.config = config
+
+
+def test_largest_r0_block_wins_over_faster_near_tie():
+    slow_big = _Cfg(4096)
+    fast_small = _Cfg(2048)
+    assert pick_deterministic_config([fast_small, slow_big]) is slow_big
+    assert config_sort_key(slow_big, 1) < config_sort_key(fast_small, 0)
+
+
+def test_rewrite_timings_picks_rule_not_clock(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    reset_pick_reports()
+    monkeypatch.setattr(
+        "vllm.compilation.inductor_autotune_pick.envs.VLLM_BATCH_INVARIANT",
+        True,
+    )
+    assert should_pick_deterministic()
+    big = _Launcher(_Cfg(4096))
+    small = _Launcher(_Cfg(2048))
+    timings = {small: 0.10, big: 0.101}
+    rewritten = maybe_rewrite_timings(
+        type("T", (), {"inductor_meta": {"kernel_name": "rms_norm"}})(),
+        timings,
+    )
+    assert min(rewritten, key=rewritten.get) is big
+    reports = pick_reports()
+    assert len(reports) == 1
+    assert reports[0]["pick_rule"] == PICK_RULE
+    assert reports[0]["differed"] is True
+    assert reports[0]["picked"]["R0_BLOCK"] == 4096
+    assert reports[0]["timed"]["R0_BLOCK"] == 2048
+    assert reports[0]["rule_slower_pct"] == pytest.approx(1.0)
+
+
+def test_rewrite_timings_skipped_without_bi(monkeypatch: pytest.MonkeyPatch):
+    reset_pick_reports()
+    monkeypatch.setattr(
+        "vllm.compilation.inductor_autotune_pick.envs.VLLM_BATCH_INVARIANT",
+        False,
+    )
+    big = _Launcher(_Cfg(4096))
+    small = _Launcher(_Cfg(2048))
+    timings = {small: 0.10, big: 0.20}
+    rewritten = maybe_rewrite_timings(object(), timings)
+    assert rewritten is timings
+    assert pick_reports() == []
+
+
+def test_guard_rewrites_autotune_pick_under_bi(monkeypatch: pytest.MonkeyPatch):
+    reset()
+    reset_pick_reports()
+    monkeypatch.setattr(
+        "vllm.compilation.inductor_autotune_pick.envs.VLLM_BATCH_INVARIANT",
+        True,
+    )
+
+    class _Tune:
+        inductor_meta = {"kernel_name": "fused_add_rms_norm"}
+
+        def autotune_to_one_config(self):
+            timings = self.benchmark_all_configs()
+            return min(timings, key=timings.get)
+
+        def benchmark_all_configs(self):
+            return {
+                _Launcher(_Cfg(2048)): 0.08,
+                _Launcher(_Cfg(4096)): 0.081,
+            }
+
+    wrap_autotuner_class(_Tune)
+    winner = _Tune().autotune_to_one_config()
+    assert winner.config.kwargs["R0_BLOCK"] == 4096
+
+
+def test_verify_ignores_time_taken_ms(tmp_path: Path):
+    pack = tmp_path / "pack"
+    ref = tmp_path / "ref"
+    (pack / "ab").mkdir(parents=True)
+    (ref / "ab").mkdir(parents=True)
+    (pack / "ab" / "k.best_config").write_text(
+        '{"R0_BLOCK": 4096, "num_warps": 8, "time_taken_ms": 12, '
+        '"triton_cache_hash": "aaa"}\n'
+    )
+    (ref / "ab" / "k.best_config").write_text(
+        '{"R0_BLOCK": 4096, "num_warps": 8, "time_taken_ms": 99, '
+        '"triton_cache_hash": "bbb"}\n'
+    )
+    report = compare_pin_packs(pack, ref)
+    assert packs_match(report)
+    assert report["identical"] == ["ab/k.best_config"]
+
+
+def test_verify_prints_differing_kernels(tmp_path: Path, capsys):
+    pack = tmp_path / "pack"
+    ref = tmp_path / "ref"
+    pack.mkdir()
+    ref.mkdir()
+    (pack / "k.best_config").write_text('{"R0_BLOCK": 4096, "num_warps": 8}\n')
+    (ref / "k.best_config").write_text('{"R0_BLOCK": 2048, "num_warps": 8}\n')
+    assert pin_main(["verify", "--pack", str(pack), "--ref", str(ref)]) == 1
+    out = capsys.readouterr().out
+    assert "differing: 1" in out
+    assert "differ k.best_config" in out
+    assert "4096" in out
+    assert "2048" in out
+    report = compare_pin_packs(pack, ref)
+    text = format_pack_diff(report)
+    assert "differ k.best_config" in text
+
+
+def test_normalize_drops_dump_noise():
+    assert normalize_best_config(
+        {"R0_BLOCK": 4096, "time_taken_ms": 1, "triton_cache_hash": "x"}
+    ) == {"R0_BLOCK": 4096}
+
+
+def test_dump_records_pick_rule(tmp_path: Path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "k.best_config").write_text('{"R0_BLOCK": 4096}\n')
+    pack = tmp_path / "pack"
+    manifest = dump_pinned_autotune_cache(cache, pack, sku_key="a100-sm80")
+    assert manifest["pick_rule"] == PICK_RULE
 
 
 class _FakeAutotuner:

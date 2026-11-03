@@ -15,6 +15,10 @@ import time
 from typing import Any
 
 import vllm.envs as envs
+from vllm.compilation.inductor_autotune_pick import (
+    maybe_rewrite_timings,
+    reset_pick_reports,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -33,6 +37,7 @@ def reset() -> None:
     """Drop recorded events. Call at the start of worker warmup."""
     with _lock:
         _events.clear()
+    reset_pick_reports()
 
 
 def recorded_events() -> list[tuple[str, float]]:
@@ -73,7 +78,10 @@ def _wrap_method(cls: type, name: str, *, count: bool) -> None:
             _in_autotune.active = True
         t0 = time.perf_counter()
         try:
-            return original(self, *args, **kwargs)
+            result = original(self, *args, **kwargs)
+            if name == "benchmark_all_configs":
+                result = maybe_rewrite_timings(self, result)
+            return result
         finally:
             if count and (
                 name != "benchmark_all_configs"
